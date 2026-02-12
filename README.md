@@ -100,3 +100,21 @@ If you have questions, feedback, or would like to explore this work further, don
 **Alexis Rufer — alexis.rufer@epfl.ch — alexis.rufer@drufer.com**
 
 Thanks for your interest in this project!
+
+
+### Execute
+
+```
+uv run python -m nationwide run \ 
+      --model models/active_teacher.pt \
+      --bbox "7.7,46.0,7.9,46.1" \      
+      --output valais_test.duckdb \
+      --device cuda:0
+```
+
+
+export
+
+```
+uv run python -m nationwide export --input valais_test.duckdb --output valais_test.geojson 
+```

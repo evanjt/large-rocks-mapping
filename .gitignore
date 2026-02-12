@@ -34,3 +34,6 @@ train*
 
 # wandb
 wandb
+*.geojson
+*.duckdb
+*.pt

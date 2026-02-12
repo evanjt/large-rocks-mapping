@@ -2,8 +2,11 @@ import utils.paths as paths
 import utils.helpers as helpers
 import os
 from ultralytics import YOLO
-from utils.arg_parser import parse_args  
-from baseline_dataset import RockDetectionDataset, CombineRGBHillshade, ReplaceRGBChannelWithHS, NonLinearHSBlackout, MultiplyRGBHS, PCAFusion
+from utils.arg_parser import parse_args
+from baseline_dataset import (
+    RockDetectionDataset,
+    ReplaceRGBChannelWithHS,
+)
 
 """
 Train a supervised YOLOv11 model using RGB+hillshade fusion inputs.
@@ -18,6 +21,7 @@ Example usage:
 python src/train_baseline.py --model src/yolo11m_single_class.yaml --project runs/baseline_rgb_hs --bbox_size 32 --rgb_channel 1
 """
 
+
 def main():
     # Parse command-line arguments
     args = parse_args()
@@ -27,24 +31,29 @@ def main():
     transform = ReplaceRGBChannelWithHS(channel=args.rgb_channel)
     # transform = NonLinearHSBlackout(threshold=args.threshold)
     # transform = MultiplyRGBHS()
-    # transform = PCAFusion()
+    # transform = PCAFusion()
 
     # LOAD DATA
-    dataset = RockDetectionDataset(json_file=paths.JSON_FILE,
-                                   root_dir=paths.RAW_DATA_DIR,
-                                   transform=transform)
-    
-    # SPLIT DATA 
-    train_samples, val_samples, test_samples = helpers.split_without_overlap(dataset, seed=42)
+    dataset = RockDetectionDataset(
+        json_file=paths.JSON_FILE,
+        root_dir=paths.RAW_DATA_DIR,
+        transform=transform,
+    )
+
+    # SPLIT DATA
+    train_samples, val_samples, test_samples = helpers.split_without_overlap(
+        dataset, seed=42
+    )
 
     # PREPARE TRAINING FILES
     helpers.prepare_yolo_training_files_all_splits(
-        train_samples, 
-        val_samples, 
-        test_samples, 
+        train_samples,
+        val_samples,
+        test_samples,
         patch_size=args.imgsz,
         bbox_width=args.bbox_size,
-        bbox_height=args.bbox_size)
+        bbox_height=args.bbox_size,
+    )
 
     # LOAD MODEL
     model = YOLO(args.model)
@@ -53,13 +62,19 @@ def main():
     root_processed_path = paths.PROCESSED_DATA_DIR
     train_relative_path = "images/train"
     val_relative_path = "images/val"
-    test_relative_path = "images/test"  
+    test_relative_path = "images/test"
     config_path = paths.BASELINE_CONFIG_YAML
-    helpers.create_config_yaml(root_processed_path, train_relative_path, val_relative_path, test_relative_path, config_path)
+    helpers.create_config_yaml(
+        root_processed_path,
+        train_relative_path,
+        val_relative_path,
+        test_relative_path,
+        config_path,
+    )
 
     # TRAIN MODEL
     results = model.train(
-        data=str(config_path),         
+        data=str(config_path),
         epochs=args.epochs,
         time=args.time,
         patience=args.patience,
@@ -94,27 +109,28 @@ def main():
         mosaic=args.mosaic,
         erasing=args.erasing,
         degrees=args.degrees,
-        seed = args.seed,
-        cache = False
+        seed=args.seed,
+        cache=False,
     )
 
     # EXTRACT METRICS ON VALIDATION
     results_val = model.val(
-        split="val", 
+        split="val",
         project=args.project + "_val",
-        )
+    )
     val_metrics_output_dir = os.path.join(args.project + "_val")
     helpers.save_metrics(results_val, val_metrics_output_dir, args.name)
 
     # EVALUATE MODEL ON TEST
     results_test = model.val(
-        split="test", 
+        split="test",
         project=args.project + "_test",
-        )
-    
+    )
+
     # EXTRACT TEST METRICS
     test_metrics_output_dir = os.path.join(args.project + "_test")
     helpers.save_metrics(results_test, test_metrics_output_dir, args.name)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
