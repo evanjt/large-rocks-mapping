@@ -110,14 +110,19 @@ def run_pipeline(
     conf: float = 0.10,
     iou: float = 0.40,
     min_elevation: float = 0,
+    max_batch_tiles: int = 0,
+    queue_maxsize: int = 0,
+    enable_monitor: bool = True,
 ) -> None:
     """Main pipeline: download+preprocess -> infer -> dedup -> store.
 
     Uses a bounded producer-consumer queue to limit memory usage:
-    download_threads workers preprocess tiles, a queue buffers results
-    (maxsize=2*download_threads), and the main thread runs batched GPU
-    inference (up to 4 tiles / 64 patches per call).
+    download_threads workers preprocess tiles, a queue buffers results,
+    and the main thread runs batched GPU inference.
     Checkpoints progress to DuckDB for resume on restart.
+
+    If max_batch_tiles=0 (default), auto-detects optimal GPU batch size.
+    If queue_maxsize=0 (default), uses download_threads * 3.
     """
     log.info(f"Total tile pairs: {len(tile_source)}")
 
@@ -134,6 +139,19 @@ def run_pipeline(
     model = YOLO(model_path)
     if device != "cpu":
         model.to(device)
+
+    # Auto-tune GPU batch size
+    if max_batch_tiles <= 0 and device != "cpu":
+        from nationwide.benchmark import probe_gpu_max_batch
+        gpu_result = probe_gpu_max_batch(model, device)
+        max_batch_tiles = gpu_result.max_batch_tiles
+        log.info(f"Auto-tuned: max_batch_tiles={max_batch_tiles} ({gpu_result.max_patches} patches)")
+    elif max_batch_tiles <= 0:
+        max_batch_tiles = 4  # Conservative CPU default
+
+    # Dynamic queue sizing
+    if queue_maxsize <= 0:
+        queue_maxsize = download_threads * 3
 
     # Init DB (includes processed_tiles table for checkpoint/resume)
     con = init_db(output_db)
@@ -154,9 +172,15 @@ def run_pipeline(
         con.close()
         return
 
-    # Bounded queue: buffer enough tiles so all producer workers can deposit
-    # without blocking. With 8 threads, maxsize=16 → ~300 MB peak memory.
-    tile_queue: queue.Queue = queue.Queue(maxsize=download_threads * 2)
+    # Bounded queue: buffer tiles for producer-consumer backpressure
+    tile_queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
+
+    # Start resource monitor
+    monitor = None
+    if enable_monitor:
+        from nationwide.monitor import ResourceMonitor
+        monitor = ResourceMonitor(tile_queue=tile_queue)
+        monitor.start()
 
     producer = threading.Thread(
         target=_producer_thread,
@@ -170,9 +194,17 @@ def run_pipeline(
     tiles_failed = 0
     t0 = time.time()
 
+    # Timing accumulators
+    t_wait_total = 0.0
+    t_infer_total = 0.0
+    t_post_total = 0.0
+    n_batches = 0
+    total_patches_inferred = 0
+
     pbar = tqdm(total=len(remaining), desc="Processing tiles", unit="tile")
 
-    MAX_BATCH_TILES = 4  # Accumulate up to 4 tiles (64 patches) per GPU call
+    MAX_BATCH_TILES = max_batch_tiles
+    max_patches = MAX_BATCH_TILES * 16  # patches per tile
 
     while True:
         # ── Accumulate a batch of tiles ──────────────────────────────
@@ -181,7 +213,9 @@ def run_pipeline(
         tiles_in_batch = 0
 
         # First tile: block until work arrives (or sentinel)
+        t_wait_start = time.time()
         item = tile_queue.get()
+        t_wait_total += time.time() - t_wait_start
         if item is None:
             break
 
@@ -233,10 +267,17 @@ def run_pipeline(
             continue
 
         # ── Run inference on accumulated patches ─────────────────────
-        detections = run_inference(model, batch_patches, conf=conf, iou=iou, device=device)
+        t_infer_start = time.time()
+        detections = run_inference(
+            model, batch_patches, conf=conf, iou=iou, device=device,
+            max_patches_per_call=max_patches,
+        )
+        t_infer_total += time.time() - t_infer_start
+        total_patches_inferred += len(batch_patches)
         del batch_patches
 
         # ── Split detections by tile_id, dedup + write per tile ──────
+        t_post_start = time.time()
         det_by_tile: dict[str, list] = defaultdict(list)
         for det in detections:
             det_by_tile[det.tile_id].append(det)
@@ -250,6 +291,8 @@ def run_pipeline(
             tiles_processed += 1
             pbar.update(1)
             pbar.set_postfix(dets=total_detections, ok=tiles_processed, fail=tiles_failed)
+        t_post_total += time.time() - t_post_start
+        n_batches += 1
 
         # If sentinel was found during batch accumulation, exit
         if pending_items and pending_items[0] is None:
@@ -258,10 +301,15 @@ def run_pipeline(
     pbar.close()
     producer.join()
 
+    # Stop resource monitor
+    if monitor is not None:
+        monitor.stop()
+
     elapsed = time.time() - t0
     rate = tiles_processed / elapsed if elapsed > 0 else 0
 
     db_total = con.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
+    avg_batch = tiles_processed / n_batches if n_batches else 0
     log.info("=" * 60)
     log.info("Pipeline complete")
     log.info(f"  Tiles processed: {tiles_processed}")
@@ -271,6 +319,22 @@ def run_pipeline(
     log.info(f"  DB total:        {db_total}")
     log.info(f"  Time:            {elapsed:.0f}s ({rate:.2f} tiles/s)")
     log.info(f"  Output:          {output_db}")
+    log.info(f"  Batch config:    max_batch_tiles={MAX_BATCH_TILES} ({max_patches} patches), queue={queue_maxsize}")
+    log.info(f"  Consumer timing ({n_batches} batches, avg {avg_batch:.1f} tiles/batch):")
+    log.info(f"    Queue wait:    {t_wait_total:.1f}s ({t_wait_total/elapsed*100:.0f}%)")
+    log.info(f"    Inference:     {t_infer_total:.1f}s ({t_infer_total/elapsed*100:.0f}%) [{total_patches_inferred} patches]")
+    log.info(f"    Dedup+write:   {t_post_total:.1f}s ({t_post_total/elapsed*100:.0f}%)")
+
+    if monitor is not None:
+        rs = monitor.summary()
+        log.info(f"  Resource usage ({rs.n_samples} samples over {rs.duration_s:.0f}s):")
+        log.info(f"    GPU util:      avg {rs.gpu_util_avg:.0f}%, max {rs.gpu_util_max:.0f}%")
+        log.info(f"    GPU VRAM:      max {rs.gpu_vram_max_mb} / {rs.gpu_vram_total_mb} MB")
+        log.info(f"    CPU:           avg {rs.cpu_avg:.0f}%, max {rs.cpu_max:.0f}%")
+        log.info(f"    RAM:           max {rs.ram_max_mb} / {rs.ram_total_mb} MB")
+        log.info(f"    Network:       {rs.net_total_mb:.0f} MB total, {rs.net_avg_mbps:.0f} Mbps avg")
+        log.info(f"    Queue depth:   avg {rs.queue_avg:.1f}, max {rs.queue_max}")
+
     log.info("=" * 60)
 
     con.close()
@@ -295,6 +359,9 @@ def run(
     iou: float = typer.Option(0.40, help="IoU threshold"),
     cache_dir: Path = typer.Option(Path("data/tile_cache"), help="Tile cache directory"),
     cache_gb: float = typer.Option(10.0, help="Max tile cache size in GB (0 to disable)"),
+    max_batch_tiles: int = typer.Option(0, help="Max tiles per GPU batch (0=auto-detect)"),
+    queue_size: int = typer.Option(0, help="Producer-consumer queue size (0=auto: download_threads*3)"),
+    no_monitor: bool = typer.Option(False, help="Disable resource monitoring"),
 ) -> None:
     """Run the nationwide rock detection pipeline."""
     init_cache(cache_dir, cache_gb)
@@ -331,7 +398,73 @@ def run(
         conf=conf,
         iou=iou,
         min_elevation=min_elevation,
+        max_batch_tiles=max_batch_tiles,
+        queue_maxsize=queue_size,
+        enable_monitor=not no_monitor,
     )
+
+
+@app.command()
+def benchmark(
+    model: Path = typer.Option(..., help="Path to YOLO .pt model"),
+    device: str = typer.Option("cuda:0", help="PyTorch device"),
+    coords: Optional[list[str]] = typer.Option(None, help="Tile coordinates for network test (e.g. 2587-1133)"),
+    bbox: Optional[str] = typer.Option(None, help="WGS84 bbox for network test (provides more URLs)"),
+    download_threads: int = typer.Option(8, help="Current download thread count (for recommendation)"),
+) -> None:
+    """Run GPU and optional network benchmarks, print recommended parameters."""
+    if not model.exists():
+        log.error(f"Model not found: {model}")
+        raise typer.Exit(code=1)
+
+    import torch
+    from ultralytics import YOLO
+    from nationwide.benchmark import (
+        measure_download_throughput,
+        probe_gpu_max_batch,
+        recommend_params,
+    )
+
+    if not device:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    log.info(f"Loading model from {model} on {device} ...")
+    yolo_model = YOLO(model)
+    if device != "cpu":
+        yolo_model.to(device)
+
+    gpu_result = probe_gpu_max_batch(yolo_model, device)
+
+    net_result = None
+    if coords:
+        url_map = resolve_batch(list(coords), threads=4)
+        # Collect RGB URLs (largest files) for throughput test
+        rgb_urls = [r for _, (r, _) in url_map.items()]
+        if rgb_urls:
+            net_result = measure_download_throughput(rgb_urls)
+    elif bbox:
+        tile_list = query_stac_bbox(bbox)
+        rgb_urls = [r for _, r, _ in tile_list[:40]]
+        if rgb_urls:
+            net_result = measure_download_throughput(rgb_urls)
+
+    params = recommend_params(gpu_result, net_result)
+
+    print()
+    print("=" * 50)
+    print("  Benchmark Results")
+    print("=" * 50)
+    print(f"  GPU max batch:     {gpu_result.max_patches} patches ({gpu_result.max_batch_tiles} tiles)")
+    print(f"  GPU peak VRAM:     {gpu_result.peak_vram_mb} MB")
+    if net_result:
+        print(f"  Per-thread speed:  {net_result.mbps_per_thread} MB/s")
+        print(f"  Best thread count: {net_result.recommended_threads}")
+    print()
+    print("  Recommended parameters:")
+    print(f"    --max-batch-tiles {params.max_batch_tiles}")
+    print(f"    --download-threads {params.download_threads}")
+    print(f"    --queue-size {params.queue_maxsize}")
+    print("=" * 50)
 
 
 @app.command()

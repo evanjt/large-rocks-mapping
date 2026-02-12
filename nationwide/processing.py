@@ -417,30 +417,68 @@ def run_inference(
     conf: float = 0.10,
     iou: float = 0.40,
     device: str = "cuda:0",
+    max_patches_per_call: int = 0,
 ) -> list[Detection]:
-    """Run YOLO on fused patches, return Detections in EPSG:2056."""
+    """Run YOLO on fused patches, return Detections in EPSG:2056.
+
+    Passes a pre-built (N, 3, H, W) tensor to model.predict() so
+    ultralytics runs a single batched forward pass instead of
+    processing each image individually.
+
+    If max_patches_per_call > 0, splits into chunks to avoid OOM.
+    This is a safety net if the auto-tuned batch was slightly too aggressive.
+    """
     if not patches:
         return []
 
-    images = []
+    import torch
+
     meta = []
+    arrays = []
     for patch_data, transform, row, col, tile_id in patches:
-        # (3, H, W) RGB -> (H, W, 3) BGR for YOLO
-        if patch_data.ndim == 3 and patch_data.shape[0] == 3:
-            img = np.transpose(patch_data, (1, 2, 0))
-            img = img[..., ::-1].copy()
-        else:
-            img = patch_data
-        images.append(img)
+        arrays.append(patch_data)  # (3, H, W) uint8 RGB
         meta.append((transform, row, col, tile_id))
 
-    results = model.predict(
-        source=images, conf=conf, iou=iou, imgsz=TILE_SIZE_PX,
-        device=device, save=False, verbose=False, batch=len(images),
-    )
+    # Determine chunk size
+    chunk_size = len(arrays) if max_patches_per_call <= 0 else max_patches_per_call
+
+    all_results = []
+    oom_fallback_detections: list[Detection] | None = None
+
+    for start in range(0, len(arrays), chunk_size):
+        end = min(start + chunk_size, len(arrays))
+        chunk_arrays = arrays[start:end]
+
+        # Stack into (N, 3, H, W) float32 normalized [0,1] tensor.
+        # Ultralytics skips per-image letterbox/BGR→RGB/normalize for tensor input,
+        # so the entire batch runs as a single GPU forward pass.
+        batch = torch.from_numpy(np.stack(chunk_arrays)).float().div_(255.0).to(device)
+
+        try:
+            results = model.predict(
+                source=batch, conf=conf, iou=iou, imgsz=TILE_SIZE_PX,
+                save=False, verbose=False,
+            )
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            # OOM fallback: halve the chunk and retry all remaining patches
+            del batch
+            torch.cuda.empty_cache()
+            half = len(chunk_arrays) // 2
+            log.warning("OOM on %d patches, retrying remaining with chunk=%d", len(chunk_arrays), half)
+            if half == 0:
+                raise
+            oom_fallback_detections = run_inference(
+                model, patches[start:], conf, iou, device, half,
+            )
+            break
+
+        all_results.extend(zip(results, meta[start:end]))
+        del batch
 
     detections = []
-    for result, (transform, row, col, tile_id) in zip(results, meta):
+    for result, (transform, row, col, tile_id) in all_results:
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
             continue
@@ -459,5 +497,8 @@ def run_inference(
                 confidence=conf_val, bbox_w_m=float(w_m), bbox_h_m=float(h_m),
                 class_id=cls,
             ))
+
+    if oom_fallback_detections is not None:
+        detections.extend(oom_fallback_detections)
 
     return detections
