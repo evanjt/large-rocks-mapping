@@ -8,6 +8,7 @@ import logging
 import queue
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,7 @@ from nationwide.db import (
 )
 from nationwide.processing import (
     dedup_detections,
+    init_cache,
     process_tile,
     run_inference,
 )
@@ -107,8 +109,9 @@ def run_pipeline(
     """Main pipeline: download+preprocess -> infer -> dedup -> store.
 
     Uses a bounded producer-consumer queue to limit memory usage:
-    download_threads workers preprocess tiles, a maxsize=2 queue buffers
-    results, and the main thread runs sequential GPU inference.
+    download_threads workers preprocess tiles, a queue buffers results
+    (maxsize=2*download_threads), and the main thread runs batched GPU
+    inference (up to 4 tiles / 64 patches per call).
     Checkpoints progress to DuckDB for resume on restart.
     """
     log.info(f"Total tile pairs: {len(tile_source)}")
@@ -146,8 +149,9 @@ def run_pipeline(
         con.close()
         return
 
-    # Bounded queue: at most 2 preprocessed tiles waiting for inference
-    tile_queue: queue.Queue = queue.Queue(maxsize=2)
+    # Bounded queue: buffer enough tiles so all producer workers can deposit
+    # without blocking. With 8 threads, maxsize=16 → ~300 MB peak memory.
+    tile_queue: queue.Queue = queue.Queue(maxsize=download_threads * 2)
 
     producer = threading.Thread(
         target=_producer_thread,
@@ -163,36 +167,88 @@ def run_pipeline(
 
     pbar = tqdm(total=len(remaining), desc="Processing tiles", unit="tile")
 
+    MAX_BATCH_TILES = 4  # Accumulate up to 4 tiles (64 patches) per GPU call
+
     while True:
+        # ── Accumulate a batch of tiles ──────────────────────────────
+        batch: list[tuple[str, list]] = []  # (tile_id, patches)
+        batch_patches: list[tuple] = []     # flat list for run_inference
+        tiles_in_batch = 0
+
+        # First tile: block until work arrives (or sentinel)
         item = tile_queue.get()
         if item is None:
             break
 
-        coord, result = item
-        tile_id = coord.replace("-", "_")
+        # Process first item + drain more without blocking
+        pending_items = [item]
+        while tiles_in_batch < MAX_BATCH_TILES:
+            if not pending_items:
+                # Try to grab more without stalling the GPU
+                try:
+                    nxt = tile_queue.get(block=False)
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    pending_items.append(nxt)
+                    break
+                pending_items.append(nxt)
+                continue
 
-        if isinstance(result, Exception):
-            tiles_failed += 1
-            log.warning(f"Tile {coord} failed: {result}")
-            pbar.update(1)
+            item = pending_items.pop(0)
+            if item is None:
+                # Put sentinel back so outer loop exits
+                pending_items.insert(0, None)
+                break
+
+            coord, result = item
+            tile_id = coord.replace("-", "_")
+
+            if isinstance(result, Exception):
+                tiles_failed += 1
+                log.warning(f"Tile {coord} failed: {result}")
+                pbar.update(1)
+                continue
+
+            patches = result
+            if not patches:
+                mark_tile_done(con, tile_id, 0)
+                tiles_processed += 1
+                pbar.update(1)
+                continue
+
+            batch.append((tile_id, patches))
+            batch_patches.extend(patches)
+            tiles_in_batch += 1
+
+        if not batch:
+            # Check if we hit the sentinel during accumulation
+            if pending_items and pending_items[0] is None:
+                break
             continue
 
-        patches = result
-        if not patches:
-            mark_tile_done(con, tile_id, 0)
+        # ── Run inference on accumulated patches ─────────────────────
+        detections = run_inference(model, batch_patches, conf=conf, iou=iou, device=device)
+        del batch_patches
+
+        # ── Split detections by tile_id, dedup + write per tile ──────
+        det_by_tile: dict[str, list] = defaultdict(list)
+        for det in detections:
+            det_by_tile[det.tile_id].append(det)
+
+        for tile_id, patches in batch:
+            del patches  # Free patch memory
+            tile_dets = dedup_detections(det_by_tile.get(tile_id, []), distance_m=7.5)
+            n = write_detections(con, tile_dets)
+            mark_tile_done(con, tile_id, n)
+            total_detections += n
             tiles_processed += 1
             pbar.update(1)
-            continue
+            pbar.set_postfix(dets=total_detections, ok=tiles_processed, fail=tiles_failed)
 
-        detections = run_inference(model, patches, conf=conf, iou=iou, device=device)
-        del patches  # Free memory before DB write
-        detections = dedup_detections(detections, distance_m=7.5)
-        n = write_detections(con, detections)
-        mark_tile_done(con, tile_id, n)
-        total_detections += n
-        tiles_processed += 1
-        pbar.update(1)
-        pbar.set_postfix(dets=total_detections, ok=tiles_processed, fail=tiles_failed)
+        # If sentinel was found during batch accumulation, exit
+        if pending_items and pending_items[0] is None:
+            break
 
     pbar.close()
     producer.join()
@@ -232,8 +288,12 @@ def run(
     max_tiles: int = typer.Option(0, help="Limit tiles (0=all)"),
     conf: float = typer.Option(0.10, help="Confidence threshold"),
     iou: float = typer.Option(0.40, help="IoU threshold"),
+    cache_dir: Path = typer.Option(Path("data/tile_cache"), help="Tile cache directory"),
+    cache_gb: float = typer.Option(10.0, help="Max tile cache size in GB (0 to disable)"),
 ) -> None:
     """Run the nationwide rock detection pipeline."""
+    init_cache(cache_dir, cache_gb)
+
     # Build tile source from the chosen input method
     if bbox:
         tile_list = query_stac_bbox(bbox)

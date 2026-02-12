@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -37,20 +39,89 @@ SRC_STRIDE_DSM = int(STRIDE_GROUND_M / DSM_RES)    # 430px
 
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
-# 8 download threads × 2 parallel downloads per tile = 16 concurrent connections
-_SESSION.mount("https://", HTTPAdapter(pool_maxsize=20, pool_connections=20))
+# 8 download threads × 1 sequential download per tile = 8 concurrent connections
+_SESSION.mount("https://", HTTPAdapter(pool_maxsize=12, pool_connections=12))
+
+
+# ── Tile cache ────────────────────────────────────────────────────────────────
+
+
+class TileCache:
+    """File-based LRU cache for downloaded tiles.
+
+    Keys are the URL filename (already unique for Swisstopo tiles).
+    LRU is tracked via file mtime (touch on hit, evict oldest).
+    """
+
+    def __init__(self, cache_dir: Path, max_bytes: int) -> None:
+        self._dir = cache_dir
+        self._max_bytes = max_bytes
+        self._lock = threading.Lock()
+        self._dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _key(url: str) -> str:
+        return Path(urlparse(url).path).name
+
+    def get(self, url: str) -> bytes | None:
+        path = self._dir / self._key(url)
+        if not path.exists():
+            return None
+        path.touch()
+        return path.read_bytes()
+
+    def put(self, url: str, data: bytes) -> None:
+        path = self._dir / self._key(url)
+        path.write_bytes(data)
+        self._evict_if_needed()
+
+    def _evict_if_needed(self) -> None:
+        with self._lock:
+            files = list(self._dir.iterdir())
+            total = sum(f.stat().st_size for f in files)
+            if total <= self._max_bytes:
+                return
+            # Sort oldest-first by mtime
+            files.sort(key=lambda f: f.stat().st_mtime)
+            for f in files:
+                if total <= self._max_bytes:
+                    break
+                size = f.stat().st_size
+                f.unlink()
+                total -= size
+                log.debug("Cache evicted %s (%d MB)", f.name, size // 1_000_000)
+
+
+_tile_cache: TileCache | None = None
+
+
+def init_cache(cache_dir: Path, max_gb: float) -> None:
+    """Initialise the module-level tile cache. Call before pipeline starts."""
+    global _tile_cache
+    if max_gb <= 0:
+        _tile_cache = None
+        return
+    _tile_cache = TileCache(cache_dir, int(max_gb * 1_000_000_000))
+    log.info("Tile cache: %s (max %.1f GB)", cache_dir, max_gb)
 
 
 # ── Download ─────────────────────────────────────────────────────────────────
 
 def download_to_memory(url: str, retries: int = 3, timeout: int = 120) -> bytes:
-    """Download a file into memory with retries."""
+    """Download a file into memory with retries. Uses tile cache when enabled."""
+    if _tile_cache is not None:
+        cached = _tile_cache.get(url)
+        if cached is not None:
+            return cached
+
     for attempt in range(1, retries + 1):
         try:
             resp = _SESSION.get(url, timeout=timeout)
             resp.raise_for_status()
             if len(resp.content) == 0:
                 raise IOError("Empty response")
+            if _tile_cache is not None:
+                _tile_cache.put(url, resp.content)
             return resp.content
         except Exception:
             if attempt == retries:
@@ -260,12 +331,10 @@ def process_tile(
     Returns list of (fused_patch, transform, row, col, tile_id).
     Each fused_patch is (3, 640, 640) uint8.
     """
-    # Download both files in parallel
-    with ThreadPoolExecutor(max_workers=2) as dl_pool:
-        rgb_future = dl_pool.submit(download_to_memory, rgb_url)
-        dsm_future = dl_pool.submit(download_to_memory, dsm_url)
-        rgb_bytes = rgb_future.result()
-        dsm_bytes = dsm_future.result()
+    # Download sequentially — outer producer pool provides cross-tile concurrency
+    # (8 workers). Nested parallelism pushed past CDN sweet spot (~4 connections).
+    rgb_bytes = download_to_memory(rgb_url)
+    dsm_bytes = download_to_memory(dsm_url)
 
     # Read DSM from memory, compute hillshade
     with rasterio.io.MemoryFile(dsm_bytes) as memfile:
