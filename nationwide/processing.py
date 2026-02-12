@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -39,8 +40,20 @@ SRC_STRIDE_DSM = int(STRIDE_GROUND_M / DSM_RES)    # 430px
 
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
-# 8 download threads × 1 sequential download per tile = 8 concurrent connections
-_SESSION.mount("https://", HTTPAdapter(pool_maxsize=12, pool_connections=12))
+# Per-process pool: 2 parallel downloads per tile
+_SESSION.mount("https://", HTTPAdapter(pool_maxsize=4, pool_connections=4))
+
+
+def reinit_session() -> None:
+    """Reinitialize HTTP session in forked worker processes.
+
+    After fork, the parent's urllib3 connection pool has stale socket FDs.
+    Each worker process must create a fresh session.
+    """
+    global _SESSION
+    _SESSION = requests.Session()
+    _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
+    _SESSION.mount("https://", HTTPAdapter(pool_maxsize=4, pool_connections=4))
 
 
 # ── Tile cache ────────────────────────────────────────────────────────────────
@@ -144,7 +157,7 @@ def generate_hillshade(
 
     ~3.6x faster than the gdaldem subprocess approach.
     """
-    dsm = dsm.astype(np.float64) * z_factor
+    dsm = dsm.astype(np.float32) * z_factor
 
     # Gradient in x and y (Horn's method using 3x3 kernel)
     padded = np.pad(dsm, 1, mode="edge")
@@ -331,10 +344,12 @@ def process_tile(
     Returns list of (fused_patch, transform, row, col, tile_id).
     Each fused_patch is (3, 640, 640) uint8.
     """
-    # Download sequentially — outer producer pool provides cross-tile concurrency
-    # (8 workers). Nested parallelism pushed past CDN sweet spot (~4 connections).
-    rgb_bytes = download_to_memory(rgb_url)
-    dsm_bytes = download_to_memory(dsm_url)
+    # Download both files in parallel within this worker process
+    with ThreadPoolExecutor(max_workers=2) as dl_pool:
+        rgb_future = dl_pool.submit(download_to_memory, rgb_url)
+        dsm_future = dl_pool.submit(download_to_memory, dsm_url)
+        rgb_bytes = rgb_future.result()
+        dsm_bytes = dsm_future.result()
 
     # Read DSM from memory, compute hillshade
     with rasterio.io.MemoryFile(dsm_bytes) as memfile:
@@ -421,7 +436,7 @@ def run_inference(
 
     results = model.predict(
         source=images, conf=conf, iou=iou, imgsz=TILE_SIZE_PX,
-        device=device, save=False, verbose=False,
+        device=device, save=False, verbose=False, batch=len(images),
     )
 
     detections = []

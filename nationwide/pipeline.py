@@ -9,7 +9,7 @@ import queue
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +26,7 @@ from nationwide.processing import (
     dedup_detections,
     init_cache,
     process_tile,
+    reinit_session,
     run_inference,
 )
 from nationwide.spatial import (
@@ -43,29 +44,34 @@ log = logging.getLogger(__name__)
 
 # ── Producer-consumer ────────────────────────────────────────────────────────
 
+def _safe_process(
+    coord: str, rgb_url: str, dsm_url: str, min_elevation: float = 0,
+) -> tuple[str, list | Exception]:
+    """Process a single tile, catching exceptions for graceful error handling.
+
+    Module-level function so it can be pickled by ProcessPoolExecutor.
+    """
+    try:
+        return (coord, process_tile(coord, rgb_url, dsm_url, min_elevation=min_elevation))
+    except Exception as exc:
+        return (coord, exc)
+
+
 def _producer_thread(
     tiles: list[tuple[str, str, str]],
     tile_queue: queue.Queue,
     download_threads: int,
     min_elevation: float = 0,
 ) -> None:
-    """Download+preprocess tiles in parallel, put results in bounded queue.
+    """Download+preprocess tiles in parallel processes, put results in queue.
 
-    Uses a ThreadPoolExecutor with `download_threads` workers. Submits
-    tiles one-for-one as each completes, so at most `download_threads`
-    tiles are in flight. The bounded queue's put() blocks when full,
-    providing backpressure to the producer.
+    Uses ProcessPoolExecutor for true CPU parallelism — avoids GIL
+    contention during rasterio TIFF decompression and numpy processing.
+    The bounded queue's put() blocks when full, providing backpressure.
     """
-
-    def _safe_process(
-        coord: str, rgb_url: str, dsm_url: str,
-    ) -> tuple[str, list | Exception]:
-        try:
-            return (coord, process_tile(coord, rgb_url, dsm_url, min_elevation=min_elevation))
-        except Exception as exc:
-            return (coord, exc)
-
-    with ThreadPoolExecutor(max_workers=download_threads) as pool:
+    with ProcessPoolExecutor(
+        max_workers=download_threads, initializer=reinit_session,
+    ) as pool:
         src = iter(tiles)
         pending: dict[concurrent.futures.Future, bool] = {}
 
@@ -73,7 +79,7 @@ def _producer_thread(
         for _ in range(download_threads):
             try:
                 c, r, d = next(src)
-                pending[pool.submit(_safe_process, c, r, d)] = True
+                pending[pool.submit(_safe_process, c, r, d, min_elevation)] = True
             except StopIteration:
                 break
 
@@ -81,7 +87,6 @@ def _producer_thread(
             done, _ = concurrent.futures.wait(
                 pending, return_when=concurrent.futures.FIRST_COMPLETED,
             )
-            # Process one completed future at a time to minimize peak memory
             future = done.pop()
             del pending[future]
             tile_queue.put(future.result())  # Blocks when queue full
@@ -89,7 +94,7 @@ def _producer_thread(
             # Refill from source
             try:
                 c, r, d = next(src)
-                pending[pool.submit(_safe_process, c, r, d)] = True
+                pending[pool.submit(_safe_process, c, r, d, min_elevation)] = True
             except StopIteration:
                 pass
 
