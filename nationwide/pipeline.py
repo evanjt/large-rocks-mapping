@@ -27,9 +27,6 @@ from nationwide.processing import (
     run_inference,
 )
 from nationwide.spatial import (
-    compute_tile_elevations,
-    download_dhm25,
-    load_filtered_coords,
     query_stac_bbox,
     resolve_batch,
 )
@@ -48,6 +45,7 @@ def _producer_thread(
     tiles: list[tuple[str, str, str]],
     tile_queue: queue.Queue,
     download_threads: int,
+    min_elevation: float = 0,
 ) -> None:
     """Download+preprocess tiles in parallel, put results in bounded queue.
 
@@ -61,7 +59,7 @@ def _producer_thread(
         coord: str, rgb_url: str, dsm_url: str,
     ) -> tuple[str, list | Exception]:
         try:
-            return (coord, process_tile(coord, rgb_url, dsm_url))
+            return (coord, process_tile(coord, rgb_url, dsm_url, min_elevation=min_elevation))
         except Exception as exc:
             return (coord, exc)
 
@@ -104,6 +102,7 @@ def run_pipeline(
     download_threads: int = 8,
     conf: float = 0.10,
     iou: float = 0.40,
+    min_elevation: float = 0,
 ) -> None:
     """Main pipeline: download+preprocess -> infer -> dedup -> store.
 
@@ -152,7 +151,7 @@ def run_pipeline(
 
     producer = threading.Thread(
         target=_producer_thread,
-        args=(remaining, tile_queue, download_threads),
+        args=(remaining, tile_queue, download_threads, min_elevation),
         daemon=True,
     )
     producer.start()
@@ -227,8 +226,7 @@ def run(
     output: Path = typer.Option(Path("detections.duckdb"), help="DuckDB output path"),
     coords: Optional[list[str]] = typer.Option(None, help="Tile coordinates (e.g. 2587-1133)"),
     bbox: Optional[str] = typer.Option(None, help="WGS84 bounding box: west,south,east,north"),
-    elevation_json: Optional[Path] = typer.Option(None, help="tile_elevations.json path"),
-    min_elevation: float = typer.Option(1500, help="Minimum elevation (m)"),
+    min_elevation: float = typer.Option(0, help="Skip tiles below this elevation in meters (0=disabled, e.g. 1500)"),
     device: str = typer.Option("cuda:0", help="PyTorch device"),
     download_threads: int = typer.Option(8, help="Download thread count"),
     max_tiles: int = typer.Option(0, help="Limit tiles (0=all)"),
@@ -239,25 +237,13 @@ def run(
     # Build tile source from the chosen input method
     if bbox:
         tile_list = query_stac_bbox(bbox)
-        if elevation_json and elevation_json.exists():
-            allowed = set(load_filtered_coords(elevation_json, min_elevation))
-            before = len(tile_list)
-            tile_list = [(c, r, d) for c, r, d in tile_list if c in allowed]
-            log.info(f"Elevation filter: {before} -> {len(tile_list)} tiles (>= {min_elevation}m)")
     elif coords:
         log.info("Resolving tile URLs ...")
         url_map = resolve_batch(list(coords), threads=download_threads)
         log.info(f"Resolved {len(url_map)}/{len(coords)} tile URL pairs")
         tile_list = [(c, r, d) for c, (r, d) in url_map.items()]
-    elif elevation_json and elevation_json.exists():
-        coord_list = load_filtered_coords(elevation_json, min_elevation)
-        log.info(f"Loaded {len(coord_list)} tiles above {min_elevation}m from {elevation_json}")
-        log.info("Resolving tile URLs ...")
-        url_map = resolve_batch(coord_list, threads=download_threads)
-        log.info(f"Resolved {len(url_map)}/{len(coord_list)} tile URL pairs")
-        tile_list = [(c, r, d) for c, (r, d) in url_map.items()]
     else:
-        log.error("No tile source. Pass --coords, --bbox, or --elevation-json.")
+        log.error("No tile source. Pass --coords or --bbox.")
         raise typer.Exit(code=1)
 
     if not tile_list:
@@ -279,6 +265,7 @@ def run(
         download_threads=download_threads,
         conf=conf,
         iou=iou,
+        min_elevation=min_elevation,
     )
 
 
@@ -356,24 +343,3 @@ def export(
     log.info(f"Exported {len(features)} detections to {output} ({geometry}, EPSG:2056)")
 
 
-@app.command()
-def generate_elevations(
-    output: Path = typer.Option(Path("data/tile_elevations.json"), help="Output JSON path"),
-    dem: Path = typer.Option(Path("data/dhm25_200.tif"), help="Path to DHM25/200 GeoTIFF (downloaded if missing)"),
-    min_elevation: float = typer.Option(1500, help="Report tile count above this threshold (m)"),
-) -> None:
-    """Download DHM25/200 DEM and compute max elevation per 1km grid cell."""
-    if not dem.exists():
-        download_dhm25(dem)
-
-    log.info(f"Computing max elevation per 1km grid cell from {dem} ...")
-    elevations = compute_tile_elevations(dem)
-    log.info(f"Total grid cells with data: {len(elevations)}")
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with open(output, "w") as f:
-        json.dump(elevations, f)
-    log.info(f"Saved elevations to {output}")
-
-    passing = sorted(k for k, v in elevations.items() if v >= min_elevation)
-    log.info(f"Tiles >= {min_elevation}m: {len(passing)} / {len(elevations)}")

@@ -247,11 +247,15 @@ def process_tile(
     coord: str,
     rgb_url: str,
     dsm_url: str,
+    min_elevation: float = 0,
 ) -> list[tuple[np.ndarray, rasterio.Affine, int, int, str]]:
     """Download, hillshade, crop, and fuse one tile entirely in memory.
 
     No temp files: downloads to bytes, opens via rasterio MemoryFile,
     computes hillshade in numpy, crops and fuses in-memory.
+
+    If min_elevation > 0, checks the DSM max value and skips processing
+    if the tile is below the threshold.
 
     Returns list of (fused_patch, transform, row, col, tile_id).
     Each fused_patch is (3, 640, 640) uint8.
@@ -270,6 +274,14 @@ def process_tile(
             dsm_transform = src.transform
             dsm_bounds = src.bounds
     del dsm_bytes
+
+    # Elevation gate: skip tiles below threshold
+    if min_elevation > 0:
+        max_elev = float(dsm_data.max())
+        if max_elev < min_elevation:
+            log.info(f"Tile {coord} below {min_elevation}m (max={max_elev:.0f}m), skipping")
+            del dsm_data, rgb_bytes
+            return []
 
     hillshade = generate_hillshade(dsm_data, res=DSM_RES)
     del dsm_data

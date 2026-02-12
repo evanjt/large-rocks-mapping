@@ -1,18 +1,12 @@
-"""Tile discovery: STAC queries, HEAD-scan URL resolution, elevation filter."""
+"""Tile discovery: STAC queries, HEAD-scan URL resolution."""
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-import time
-import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from typing import Iterator
 
-import numpy as np
-import rasterio
 import requests
 from tqdm import tqdm
 
@@ -32,8 +26,6 @@ _DSM_TEMPLATE = (
     "swisssurface3d-raster_{year}_{coord}_0.5_2056_5728.tif"
 )
 
-_DHM25_URL = "https://data.geo.admin.ch/ch.swisstopo.digitales-hoehenmodell_25/data.zip"
-
 _STAC_BASE = "https://data.geo.admin.ch/api/stac/v0.9"
 _SI_COLLECTION = "ch.swisstopo.swissimage-dop10"
 _DSM_COLLECTION = "ch.swisstopo.swisssurface3d-raster"
@@ -44,7 +36,7 @@ _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
 
 
-# ── HEAD-scan URL resolution (used for --coords / --elevation-json) ─────────
+# ── HEAD-scan URL resolution (used for --coords) ────────────────────────────
 
 def _find_latest_url(
     template: str, coord: str, max_year: int = 2026, min_year: int = 2017,
@@ -165,106 +157,3 @@ def query_stac_bbox(bbox: str) -> list[tuple[str, str, str]]:
     common = sorted(set(rgb_tiles) & set(dsm_tiles))
     log.info(f"  Matched pairs: {len(common)}")
     return [(c, rgb_tiles[c], dsm_tiles[c]) for c in common]
-
-
-# ── Elevation filter ─────────────────────────────────────────────────────────
-
-def load_filtered_coords(
-    elevation_json: Path, min_elevation: float,
-) -> list[str]:
-    """Load tile_elevations.json, return coords above threshold as XXXX-YYYY."""
-    with open(elevation_json) as f:
-        elevations: dict[str, float] = json.load(f)
-    return sorted(
-        k.replace("_", "-") for k, v in elevations.items() if v >= min_elevation
-    )
-
-
-def download_dhm25(dest: Path) -> Path:
-    """Download DHM25/200 DEM zip and extract the GeoTIFF."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    zip_path = dest.parent / "dhm25_200.zip"
-
-    if dest.exists():
-        log.info(f"DEM already exists: {dest}")
-        return dest
-
-    log.info(f"Downloading DHM25/200 from {_DHM25_URL} ...")
-    resp = _SESSION.get(_DHM25_URL, stream=True, timeout=120)
-    resp.raise_for_status()
-    total = int(resp.headers.get("content-length", 0))
-
-    with open(zip_path, "wb") as f:
-        with tqdm(total=total, unit="B", unit_scale=True, desc="DHM25") as pbar:
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                f.write(chunk)
-                pbar.update(len(chunk))
-
-    log.info("Extracting ...")
-    with zipfile.ZipFile(zip_path) as zf:
-        tif_names = [n for n in zf.namelist() if n.endswith(".tif")]
-        if not tif_names:
-            raise RuntimeError(f"No .tif found in {zip_path}")
-        zf.extract(tif_names[0], dest.parent)
-        extracted = dest.parent / tif_names[0]
-        if extracted != dest:
-            extracted.rename(dest)
-
-    zip_path.unlink()
-    log.info(f"DEM saved to {dest}")
-    return dest
-
-
-def compute_tile_elevations(
-    dem_path: Path,
-    grid_step_m: int = 1000,
-) -> dict[str, float]:
-    """Compute max elevation per 1km LV95 grid cell from DHM25/200 DEM.
-
-    Returns dict mapping "XXXX_YYYY" -> max_elevation_m.
-    """
-    with rasterio.open(dem_path) as src:
-        dem = src.read(1)
-        transform = src.transform
-        nodata = src.nodata
-        bounds = src.bounds
-
-    x_min = int(bounds.left // grid_step_m) * grid_step_m
-    x_max = int(np.ceil(bounds.right / grid_step_m)) * grid_step_m
-    y_min = int(bounds.bottom // grid_step_m) * grid_step_m
-    y_max = int(np.ceil(bounds.top / grid_step_m)) * grid_step_m
-
-    result = {}
-    xs = range(x_min, x_max, grid_step_m)
-    ys = range(y_min, y_max, grid_step_m)
-
-    for gx in tqdm(xs, desc="Grid cols"):
-        for gy in ys:
-            cell_left, cell_right = gx, gx + grid_step_m
-            cell_bottom, cell_top = gy, gy + grid_step_m
-
-            col_start, row_start = ~transform * (cell_left, cell_top)
-            col_end, row_end = ~transform * (cell_right, cell_bottom)
-
-            r0 = max(0, int(row_start))
-            r1 = min(dem.shape[0], int(np.ceil(row_end)))
-            c0 = max(0, int(col_start))
-            c1 = min(dem.shape[1], int(np.ceil(col_end)))
-
-            if r0 >= r1 or c0 >= c1:
-                continue
-
-            window = dem[r0:r1, c0:c1]
-            if nodata is not None:
-                valid = window[window != nodata]
-            else:
-                valid = window.ravel()
-
-            if len(valid) == 0:
-                continue
-
-            max_elev = float(valid.max())
-            tile_id = f"{gx // 1000}_{gy // 1000}"
-            result[tile_id] = round(max_elev, 1)
-
-    return result
