@@ -37,3 +37,6 @@ wandb
 *.geojson
 *.duckdb
 *.pt
+*.gpkg
+
+models/

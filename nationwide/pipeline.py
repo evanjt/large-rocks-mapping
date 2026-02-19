@@ -24,14 +24,17 @@ from nationwide.db import (
 )
 from nationwide.processing import (
     dedup_detections,
+    get_cache_config,
     init_cache,
     process_tile,
     reinit_session,
     run_inference,
 )
 from nationwide.spatial import (
+    SWITZERLAND_BBOX,
     query_stac_bbox,
     resolve_batch,
+    set_stac_cache_dir,
 )
 
 logging.basicConfig(
@@ -69,8 +72,14 @@ def _producer_thread(
     contention during rasterio TIFF decompression and numpy processing.
     The bounded queue's put() blocks when full, providing backpressure.
     """
+    # Pass cache config so worker processes can reconstruct the tile cache
+    cc = get_cache_config()
+    init_args = (cc[0], cc[1]) if cc else (None, 0)
+
     with ProcessPoolExecutor(
-        max_workers=download_threads, initializer=reinit_session,
+        max_workers=download_threads,
+        initializer=reinit_session,
+        initargs=init_args,
     ) as pool:
         src = iter(tiles)
         pending: dict[concurrent.futures.Future, bool] = {}
@@ -351,6 +360,7 @@ def run(
     output: Path = typer.Option(Path("detections.duckdb"), help="DuckDB output path"),
     coords: Optional[list[str]] = typer.Option(None, help="Tile coordinates (e.g. 2587-1133)"),
     bbox: Optional[str] = typer.Option(None, help="WGS84 bounding box: west,south,east,north"),
+    all_switzerland: bool = typer.Option(False, "--all", help="Process all of Switzerland"),
     min_elevation: float = typer.Option(0, help="Skip tiles below this elevation in meters (0=disabled, e.g. 1500)"),
     device: str = typer.Option("cuda:0", help="PyTorch device"),
     download_threads: int = typer.Option(8, help="Download thread count"),
@@ -365,8 +375,11 @@ def run(
 ) -> None:
     """Run the nationwide rock detection pipeline."""
     init_cache(cache_dir, cache_gb)
+    set_stac_cache_dir(cache_dir)
 
     # Build tile source from the chosen input method
+    if all_switzerland:
+        bbox = SWITZERLAND_BBOX
     if bbox:
         tile_list = query_stac_bbox(bbox)
     elif coords:
@@ -470,15 +483,25 @@ def benchmark(
 @app.command()
 def export(
     input_db: Path = typer.Option(..., "--input", help="DuckDB database path"),
-    output: Path = typer.Option(..., help="Output GeoJSON path"),
+    output: Path = typer.Option(..., help="Output path (.gpkg or .geojson)"),
     min_confidence: float = typer.Option(0.0, help="Minimum confidence filter"),
     geometry: str = typer.Option("polygon", help="Geometry type: 'point' or 'polygon'"),
 ) -> None:
-    """Export detections from DuckDB to GeoJSON (EPSG:2056)."""
+    """Export detections from DuckDB to GeoPackage or GeoJSON (EPSG:2056).
+
+    Format is detected from the output file extension:
+      .gpkg     → GeoPackage (default, recommended)
+      .geojson  → GeoJSON
+    """
     import duckdb
 
     if not input_db.exists():
         log.error(f"Database not found: {input_db}")
+        raise typer.Exit(code=1)
+
+    ext = output.suffix.lower()
+    if ext not in (".gpkg", ".geojson", ".json"):
+        log.error(f"Unsupported output format '{ext}'. Use .gpkg or .geojson")
         raise typer.Exit(code=1)
 
     con = duckdb.connect(str(input_db), read_only=True)
@@ -495,7 +518,48 @@ def export(
         raise typer.Exit(code=1)
 
     use_polygon = geometry.lower().startswith("poly")
+    output.parent.mkdir(parents=True, exist_ok=True)
 
+    if ext == ".gpkg":
+        _export_gpkg(rows, output, use_polygon)
+    else:
+        _export_geojson(rows, output, use_polygon)
+
+    log.info(f"Exported {len(rows)} detections to {output} ({geometry}, EPSG:2056)")
+
+
+def _export_gpkg(
+    rows: list[tuple], output: Path, use_polygon: bool,
+) -> None:
+    """Write detections to a GeoPackage file."""
+    import geopandas as gpd
+    from shapely.geometry import Point, box
+
+    records = []
+    for tile_id, patch_id, e, n, conf, w_m, h_m, cls in rows:
+        if use_polygon:
+            hw, hh = w_m / 2, h_m / 2
+            geom = box(e - hw, n - hh, e + hw, n + hh)
+        else:
+            geom = Point(e, n)
+        records.append({
+            "tile_id": tile_id,
+            "patch_id": patch_id,
+            "confidence": round(conf, 4),
+            "bbox_w_m": round(w_m, 2),
+            "bbox_h_m": round(h_m, 2),
+            "class_id": cls,
+            "geometry": geom,
+        })
+
+    gdf = gpd.GeoDataFrame(records, crs="EPSG:2056")
+    gdf.to_file(output, driver="GPKG", layer="rock_detections")
+
+
+def _export_geojson(
+    rows: list[tuple], output: Path, use_polygon: bool,
+) -> None:
+    """Write detections to a GeoJSON file."""
     features = []
     for tile_id, patch_id, e, n, conf, w_m, h_m, cls in rows:
         if use_polygon:
@@ -534,10 +598,7 @@ def export(
         "features": features,
     }
 
-    output.parent.mkdir(parents=True, exist_ok=True)
     with open(output, "w") as f:
         json.dump(geojson, f)
-
-    log.info(f"Exported {len(features)} detections to {output} ({geometry}, EPSG:2056)")
 
 

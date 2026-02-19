@@ -44,16 +44,21 @@ _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
 _SESSION.mount("https://", HTTPAdapter(pool_maxsize=4, pool_connections=4))
 
 
-def reinit_session() -> None:
-    """Reinitialize HTTP session in forked worker processes.
+def reinit_session(cache_dir: str | None = None, cache_max_bytes: int = 0) -> None:
+    """Reinitialize HTTP session and tile cache in worker processes.
 
-    After fork, the parent's urllib3 connection pool has stale socket FDs.
-    Each worker process must create a fresh session.
+    ProcessPoolExecutor workers (especially with forkserver/spawn) get a
+    fresh module import where _tile_cache is None. We must re-create the
+    cache in each worker so download_to_memory() can use it.
     """
-    global _SESSION
+    global _SESSION, _tile_cache
     _SESSION = requests.Session()
     _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
     _SESSION.mount("https://", HTTPAdapter(pool_maxsize=4, pool_connections=4))
+    if cache_dir is not None and cache_max_bytes > 0:
+        _tile_cache = TileCache(Path(cache_dir), cache_max_bytes)
+    else:
+        _tile_cache = None
 
 
 # ── Tile cache ────────────────────────────────────────────────────────────────
@@ -108,14 +113,25 @@ class TileCache:
 _tile_cache: TileCache | None = None
 
 
+_cache_config: tuple[str, int] | None = None
+
+
 def init_cache(cache_dir: Path, max_gb: float) -> None:
     """Initialise the module-level tile cache. Call before pipeline starts."""
-    global _tile_cache
+    global _tile_cache, _cache_config
     if max_gb <= 0:
         _tile_cache = None
+        _cache_config = None
         return
-    _tile_cache = TileCache(cache_dir, int(max_gb * 1_000_000_000))
+    max_bytes = int(max_gb * 1_000_000_000)
+    _tile_cache = TileCache(cache_dir, max_bytes)
+    _cache_config = (str(cache_dir), max_bytes)
     log.info("Tile cache: %s (max %.1f GB)", cache_dir, max_gb)
+
+
+def get_cache_config() -> tuple[str, int] | None:
+    """Return (cache_dir, max_bytes) for passing to worker initializers."""
+    return _cache_config
 
 
 # ── Download ─────────────────────────────────────────────────────────────────
