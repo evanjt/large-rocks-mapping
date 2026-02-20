@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -17,12 +14,12 @@ import rasterio.io
 import requests
 from requests.adapters import HTTPAdapter
 
+from nationwide.cache import cache_get, cache_put, reinit_cache
 from nationwide.db import Detection
 
 log = logging.getLogger(__name__)
 
-# ── Patch geometry constants (match training data) ───────────────────────────
-
+# Patch geometry constants (match training data)
 TILE_SIZE_PX = 640
 OVERLAP_PX = 210
 TARGET_RES = 0.5          # m/pixel (output)
@@ -30,118 +27,37 @@ SWISSIMAGE_RES = 0.1      # m/pixel (source RGB)
 DSM_RES = 0.5             # m/pixel (source DSM)
 FUSION_CHANNEL = 1        # Replace green channel
 
-TILE_GROUND_M = TILE_SIZE_PX * TARGET_RES          # 320m
-STRIDE_PX = TILE_SIZE_PX - OVERLAP_PX              # 430px
-STRIDE_GROUND_M = STRIDE_PX * TARGET_RES           # 215m
-SRC_CROP_RGB = int(TILE_GROUND_M / SWISSIMAGE_RES) # 3200px
+TILE_GROUND_M = TILE_SIZE_PX * TARGET_RES               # 320m
+STRIDE_PX = TILE_SIZE_PX - OVERLAP_PX                   # 430px
+STRIDE_GROUND_M = STRIDE_PX * TARGET_RES                # 215m
+SRC_CROP_RGB = int(TILE_GROUND_M / SWISSIMAGE_RES)      # 3200px
 SRC_STRIDE_RGB = int(STRIDE_GROUND_M / SWISSIMAGE_RES)  # 2150px
-SRC_CROP_DSM = int(TILE_GROUND_M / DSM_RES)        # 640px
-SRC_STRIDE_DSM = int(STRIDE_GROUND_M / DSM_RES)    # 430px
+SRC_CROP_DSM = int(TILE_GROUND_M / DSM_RES)             # 640px
+SRC_STRIDE_DSM = int(STRIDE_GROUND_M / DSM_RES)         # 430px
 
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
-# Per-process pool: 2 parallel downloads per tile
 _SESSION.mount("https://", HTTPAdapter(pool_maxsize=4, pool_connections=4))
 
 
 def reinit_session(cache_dir: str | None = None, cache_max_bytes: int = 0) -> None:
     """Reinitialize HTTP session and tile cache in worker processes.
 
-    ProcessPoolExecutor workers (especially with forkserver/spawn) get a
-    fresh module import where _tile_cache is None. We must re-create the
-    cache in each worker so download_to_memory() can use it.
+    ProcessPoolExecutor workers get a fresh module import —
+    must re-create session and cache in each worker.
     """
-    global _SESSION, _tile_cache
+    global _SESSION
     _SESSION = requests.Session()
     _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
     _SESSION.mount("https://", HTTPAdapter(pool_maxsize=4, pool_connections=4))
-    if cache_dir is not None and cache_max_bytes > 0:
-        _tile_cache = TileCache(Path(cache_dir), cache_max_bytes)
-    else:
-        _tile_cache = None
+    reinit_cache(cache_dir, cache_max_bytes)
 
-
-# ── Tile cache ────────────────────────────────────────────────────────────────
-
-
-class TileCache:
-    """File-based LRU cache for downloaded tiles.
-
-    Keys are the URL filename (already unique for Swisstopo tiles).
-    LRU is tracked via file mtime (touch on hit, evict oldest).
-    """
-
-    def __init__(self, cache_dir: Path, max_bytes: int) -> None:
-        self._dir = cache_dir
-        self._max_bytes = max_bytes
-        self._lock = threading.Lock()
-        self._dir.mkdir(parents=True, exist_ok=True)
-
-    @staticmethod
-    def _key(url: str) -> str:
-        return Path(urlparse(url).path).name
-
-    def get(self, url: str) -> bytes | None:
-        path = self._dir / self._key(url)
-        if not path.exists():
-            return None
-        path.touch()
-        return path.read_bytes()
-
-    def put(self, url: str, data: bytes) -> None:
-        path = self._dir / self._key(url)
-        path.write_bytes(data)
-        self._evict_if_needed()
-
-    def _evict_if_needed(self) -> None:
-        with self._lock:
-            files = list(self._dir.iterdir())
-            total = sum(f.stat().st_size for f in files)
-            if total <= self._max_bytes:
-                return
-            # Sort oldest-first by mtime
-            files.sort(key=lambda f: f.stat().st_mtime)
-            for f in files:
-                if total <= self._max_bytes:
-                    break
-                size = f.stat().st_size
-                f.unlink()
-                total -= size
-                log.debug("Cache evicted %s (%d MB)", f.name, size // 1_000_000)
-
-
-_tile_cache: TileCache | None = None
-
-
-_cache_config: tuple[str, int] | None = None
-
-
-def init_cache(cache_dir: Path, max_gb: float) -> None:
-    """Initialise the module-level tile cache. Call before pipeline starts."""
-    global _tile_cache, _cache_config
-    if max_gb <= 0:
-        _tile_cache = None
-        _cache_config = None
-        return
-    max_bytes = int(max_gb * 1_000_000_000)
-    _tile_cache = TileCache(cache_dir, max_bytes)
-    _cache_config = (str(cache_dir), max_bytes)
-    log.info("Tile cache: %s (max %.1f GB)", cache_dir, max_gb)
-
-
-def get_cache_config() -> tuple[str, int] | None:
-    """Return (cache_dir, max_bytes) for passing to worker initializers."""
-    return _cache_config
-
-
-# ── Download ─────────────────────────────────────────────────────────────────
 
 def download_to_memory(url: str, retries: int = 3, timeout: int = 120) -> bytes:
     """Download a file into memory with retries. Uses tile cache when enabled."""
-    if _tile_cache is not None:
-        cached = _tile_cache.get(url)
-        if cached is not None:
-            return cached
+    cached = cache_get(url)
+    if cached is not None:
+        return cached
 
     for attempt in range(1, retries + 1):
         try:
@@ -149,8 +65,7 @@ def download_to_memory(url: str, retries: int = 3, timeout: int = 120) -> bytes:
             resp.raise_for_status()
             if len(resp.content) == 0:
                 raise IOError("Empty response")
-            if _tile_cache is not None:
-                _tile_cache.put(url, resp.content)
+            cache_put(url, resp.content)
             return resp.content
         except Exception:
             if attempt == retries:
@@ -159,28 +74,18 @@ def download_to_memory(url: str, retries: int = 3, timeout: int = 120) -> bytes:
     raise RuntimeError("Unreachable")
 
 
-# ── Hillshade ────────────────────────────────────────────────────────────────
-
 def generate_hillshade(
     dsm: np.ndarray,
     res: float = 0.5,
     z_factor: float = 1.0,
 ) -> np.ndarray:
-    """Overhead hillshade from slope magnitude — verified match to training data.
-
-    Computes: shade = 255 × cos(slope), where slope is derived via Horn's method.
-    This is equivalent to standard hillshade with sun at zenith (altitude=90°).
+    """Overhead hillshade from slope magnitude: shade = 255 * cos(slope).
 
     Validated against 16 training patches of tile 2581-1126:
     r=0.999+, MAE=0.029, 99.87% of pixels within 1.0 of training values.
-
-    The thesis documents "QGIS hillshade (azimuth 0°, vertical angle 0°)" but
-    those parameters produce a mostly-black raster. The actual training patches
-    match this overhead formula (the thesis likely has incorrect parameter values).
     """
     dsm = dsm.astype(np.float32) * z_factor
 
-    # Gradient in x and y (Horn's method using 3x3 kernel)
     padded = np.pad(dsm, 1, mode="edge")
 
     dzdx = (
@@ -193,15 +98,12 @@ def generate_hillshade(
         - (padded[2:, :-2] + 2 * padded[2:, 1:-1] + padded[2:, 2:])
     ) / (8.0 * res)
 
-    # Overhead diffuse formula: shade = cos(slope)
     slope_rad = np.arctan(np.sqrt(dzdx**2 + dzdy**2))
     shade = np.cos(slope_rad)
 
     shade = np.clip(shade * 255.0, 0, 255).astype(np.uint8)
     return shade
 
-
-# ── Crop patches ─────────────────────────────────────────────────────────────
 
 def crop_patches(
     data: np.ndarray,
@@ -212,15 +114,7 @@ def crop_patches(
 ) -> list[tuple[np.ndarray, rasterio.Affine, int, int]]:
     """Extract overlapping patches from a raster array.
 
-    Args:
-        data: (bands, H, W) or (H, W) array.
-        transform: Affine transform of the source raster.
-        crop_px: Window size in source pixels.
-        stride_px: Stride in source pixels.
-        out_px: Output patch size (resampled if != crop_px).
-
-    Returns:
-        List of (patch_array, patch_transform, row_idx, col_idx).
+    Returns list of (patch_array, patch_transform, row_idx, col_idx).
     """
     is_2d = data.ndim == 2
     h, w = data.shape[-2:]
@@ -237,7 +131,6 @@ def crop_patches(
             else:
                 window = data[:, y_off:y_off + crop_px, x_off:x_off + crop_px]
 
-            # Resample if needed
             if crop_px != out_px:
                 if is_2d:
                     patch = cv2.resize(
@@ -252,7 +145,6 @@ def crop_patches(
             else:
                 patch = window.copy()
 
-            # Compute transform for this patch
             x_map = transform.c + x_off * transform.a
             y_map = transform.f + y_off * transform.e
             patch_res_x = (crop_px * transform.a) / out_px
@@ -270,8 +162,6 @@ def crop_patches(
     return patches
 
 
-# ── Fusion ───────────────────────────────────────────────────────────────────
-
 def fuse_rgb_hillshade(
     rgb: np.ndarray, hillshade: np.ndarray, channel: int = 1,
 ) -> np.ndarray:
@@ -281,16 +171,11 @@ def fuse_rgb_hillshade(
     return fused
 
 
-# ── YOLO coordinate transform ───────────────────────────────────────────────
-
 def yolo_to_map_coords(
     cx: float, cy: float, w: float, h: float,
     img_size: int, transform: rasterio.Affine,
 ) -> tuple[float, float, float, float]:
-    """Convert YOLO normalized coords to EPSG:2056 centroid + bbox meters.
-
-    Returns (easting, northing, width_m, height_m).
-    """
+    """Convert YOLO normalized coords to EPSG:2056 centroid + bbox meters."""
     px, py = cx * img_size, cy * img_size
     pw, ph = w * img_size, h * img_size
     easting, northing = transform * (px, py)
@@ -298,8 +183,6 @@ def yolo_to_map_coords(
     height_m = abs(ph * transform.e)
     return easting, northing, width_m, height_m
 
-
-# ── Deduplication ────────────────────────────────────────────────────────────
 
 def dedup_detections(
     detections: list[Detection], distance_m: float = 7.5,
@@ -318,7 +201,6 @@ def dedup_detections(
             kept.extend(tile_dets)
             continue
 
-        # Sort by confidence descending
         indexed = sorted(
             enumerate(tile_dets), key=lambda x: x[1].confidence, reverse=True,
         )
@@ -345,8 +227,6 @@ def dedup_detections(
     return kept
 
 
-# ── Tile processing (in-memory) ──────────────────────────────────────────────
-
 def process_tile(
     coord: str,
     rgb_url: str,
@@ -355,23 +235,15 @@ def process_tile(
 ) -> list[tuple[np.ndarray, rasterio.Affine, int, int, str]]:
     """Download, hillshade, crop, and fuse one tile entirely in memory.
 
-    No temp files: downloads to bytes, opens via rasterio MemoryFile,
-    computes hillshade in numpy, crops and fuses in-memory.
-
-    If min_elevation > 0, checks the DSM max value and skips processing
-    if the tile is below the threshold.
-
     Returns list of (fused_patch, transform, row, col, tile_id).
     Each fused_patch is (3, 640, 640) uint8.
     """
-    # Download both files in parallel within this worker process
     with ThreadPoolExecutor(max_workers=2) as dl_pool:
         rgb_future = dl_pool.submit(download_to_memory, rgb_url)
         dsm_future = dl_pool.submit(download_to_memory, dsm_url)
         rgb_bytes = rgb_future.result()
         dsm_bytes = dsm_future.result()
 
-    # Read DSM from memory, compute hillshade
     with rasterio.io.MemoryFile(dsm_bytes) as memfile:
         with memfile.open() as src:
             dsm_data = src.read(1)
@@ -379,25 +251,23 @@ def process_tile(
             dsm_bounds = src.bounds
     del dsm_bytes
 
-    # Elevation gate: skip tiles below threshold
     if min_elevation > 0:
         max_elev = float(dsm_data.max())
         if max_elev < min_elevation:
-            log.info(f"Tile {coord} below {min_elevation}m (max={max_elev:.0f}m), skipping")
+            log.debug(f"Tile {coord} below {min_elevation}m (max={max_elev:.0f}m), skipping")
             del dsm_data, rgb_bytes
             return []
 
     hillshade = generate_hillshade(dsm_data, res=DSM_RES)
     del dsm_data
 
-    # Crop hillshade patches (DSM already at target res)
+    # DSM already at target res — no resampling needed
     hs_patches = crop_patches(
         hillshade, dsm_transform,
         crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM, out_px=TILE_SIZE_PX,
     )
     del hillshade
 
-    # Read RGB from memory
     with rasterio.io.MemoryFile(rgb_bytes) as memfile:
         with memfile.open() as src:
             rgb_data = src.read()
@@ -406,19 +276,17 @@ def process_tile(
     if rgb_data.shape[0] > 3:
         rgb_data = rgb_data[:3]
 
-    # Crop RGB patches (higher res, needs resampling)
     rgb_patches = crop_patches(
         rgb_data, rgb_transform,
         crop_px=SRC_CROP_RGB, stride_px=SRC_STRIDE_RGB, out_px=TILE_SIZE_PX,
     )
     del rgb_data
 
-    # Tile ID from DSM bounds (LV95 km grid)
+    # LV95 km grid
     grid_x = int(dsm_bounds.left) // 1000
     grid_y = int(dsm_bounds.bottom) // 1000
     tile_id = f"{grid_x}_{grid_y}"
 
-    # Fuse matching patches
     results = []
     for (hs_patch, hs_tf, row, col), (rgb_patch, _, _, _) in zip(
         hs_patches, rgb_patches,
@@ -428,8 +296,6 @@ def process_tile(
 
     return results
 
-
-# ── Inference ────────────────────────────────────────────────────────────────
 
 def run_inference(
     model,
@@ -441,12 +307,8 @@ def run_inference(
 ) -> list[Detection]:
     """Run YOLO on fused patches, return Detections in EPSG:2056.
 
-    Passes a pre-built (N, 3, H, W) tensor to model.predict() so
-    ultralytics runs a single batched forward pass instead of
-    processing each image individually.
-
+    Passes a pre-built (N, 3, H, W) tensor for single batched forward pass.
     If max_patches_per_call > 0, splits into chunks to avoid OOM.
-    This is a safety net if the auto-tuned batch was slightly too aggressive.
     """
     if not patches:
         return []
@@ -456,10 +318,9 @@ def run_inference(
     meta = []
     arrays = []
     for patch_data, transform, row, col, tile_id in patches:
-        arrays.append(patch_data)  # (3, H, W) uint8 RGB
+        arrays.append(patch_data)
         meta.append((transform, row, col, tile_id))
 
-    # Determine chunk size
     chunk_size = len(arrays) if max_patches_per_call <= 0 else max_patches_per_call
 
     all_results = []
@@ -469,9 +330,6 @@ def run_inference(
         end = min(start + chunk_size, len(arrays))
         chunk_arrays = arrays[start:end]
 
-        # Stack into (N, 3, H, W) float32 normalized [0,1] tensor.
-        # Ultralytics skips per-image letterbox/BGR→RGB/normalize for tensor input,
-        # so the entire batch runs as a single GPU forward pass.
         batch = torch.from_numpy(np.stack(chunk_arrays)).float().div_(255.0).to(device)
 
         try:
@@ -482,7 +340,6 @@ def run_inference(
         except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
             if "out of memory" not in str(exc).lower():
                 raise
-            # OOM fallback: halve the chunk and retry all remaining patches
             del batch
             torch.cuda.empty_cache()
             half = len(chunk_arrays) // 2
@@ -520,46 +377,5 @@ def run_inference(
 
     if oom_fallback_detections is not None:
         detections.extend(oom_fallback_detections)
-
-    return detections
-
-
-# ── Scientist-facing summary ─────────────────────────────────────────────────
-
-def process_and_detect(
-    coord: str,
-    rgb_url: str,
-    dsm_url: str,
-    model,
-    conf: float = 0.10,
-    iou: float = 0.40,
-    device: str = "cuda:0",
-    dedup_distance_m: float = 7.5,
-    min_elevation: float = 0,
-) -> list[Detection]:
-    """Complete pipeline for one tile — the scientist should read this function.
-
-    Steps:
-        1. Download RGB (SwissIMAGE 0.1m) and DSM (swissSURFACE3D 0.5m)
-           Source: Swisstopo — verified bit-exact to training data
-        2. Generate hillshade from DSM: shade = 255 × cos(slope)
-           Verified match to training patches (r=0.999, MAE=0.029)
-        3. Crop both into 640×640 patches at 0.5m/px (4×4 grid, 210px overlap)
-        4. Fuse: replace green channel (index 1) with hillshade
-        5. Run YOLO inference (conf=0.10, iou=0.40, imgsz=640)
-        6. Deduplicate detections within 7.5m
-
-    Returns list of Detection objects in EPSG:2056 coordinates.
-    """
-    # Steps 1–4: download, hillshade, crop, fuse
-    patches = process_tile(coord, rgb_url, dsm_url, min_elevation=min_elevation)
-    if not patches:
-        return []
-
-    # Step 5: YOLO inference
-    detections = run_inference(model, patches, conf=conf, iou=iou, device=device)
-
-    # Step 6: spatial deduplication
-    detections = dedup_detections(detections, distance_m=dedup_distance_m)
 
     return detections

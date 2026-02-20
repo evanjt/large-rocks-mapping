@@ -107,7 +107,11 @@ The `nationwide/` directory contains a streaming pipeline that applies the train
 
 ```bash
 # Install (requires uv, Python >=3.11, GDAL CLI tools)
-uv pip install -e .
+uv sync
+
+# AMD GPU — replace CUDA torch with ROCm build:
+uv pip install torch torchvision pytorch-triton-rocm \
+    --index-url https://download.pytorch.org/whl/rocm6.3
 
 # Run on specific tiles
 rock-detect run --model models/active_teacher.pt --coords 2587-1133
@@ -118,8 +122,8 @@ rock-detect export --input detections.duckdb --output detections.geojson
 
 # Code Structure
 
-- `src/`, `utils/` — Original research code (training, dataset, inference). Unchanged from the scientist's version.
-- `nationwide/` — Deployment pipeline applying the trained model to Swisstopo tiles at national scale. See `process_and_detect()` in `nationwide/processing.py` for the complete single-tile lifecycle.
+- `src/`, `utils/` — Original research code (training, dataset, inference). Unchanged from the original.
+- `nationwide/` — Deployment pipeline applying the trained model to Swisstopo tiles at national scale.
 
 # Preprocessing Verification
 
