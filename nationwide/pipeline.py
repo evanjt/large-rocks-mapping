@@ -1,19 +1,14 @@
-"""Pipeline orchestrator and CLI."""
-
-from __future__ import annotations
-
 import concurrent.futures
 import logging
 import os
 import queue
 import threading
 import time
+import typer
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Optional
-
-import typer
 from tqdm import tqdm
 
 from nationwide.db import (
@@ -23,7 +18,7 @@ from nationwide.db import (
     write_detections,
 )
 from nationwide.cache import get_cache_config, init_cache, set_stac_cache_dir
-from utils.constants import SWITZERLAND_BBOX
+from utils.constants import SWITZERLAND_BBOX, TILE_SIZE_PX
 from nationwide.processing import (
     check_elevation,
     dedup_detections,
@@ -44,7 +39,7 @@ log = logging.getLogger(__name__)
 def _safe_process(
     coord: str, rgb_url: str, dsm_url: str,
 ) -> tuple[str, list | Exception]:
-    """Process a single tile, catching exceptions for graceful error handling."""
+    """Process single tile, catching exceptions for graceful error handling"""
     try:
         return (coord, process_tile(coord, rgb_url, dsm_url))
     except Exception as exc:
@@ -96,6 +91,35 @@ def _producer_thread(
     tile_queue.put(None)  # Sentinel
 
 
+def _writer_thread(
+    con,
+    write_queue: queue.Queue,
+    stats: dict,
+    pbar,
+) -> None:
+    """Background thread: dedup + write detections + checkpoint to DuckDB."""
+    while True:
+        item = write_queue.get()
+        if item is None:
+            break
+        tile_id, detections = item
+        try:
+            tile_dets = dedup_detections(detections, distance_m=7.5)
+            n = write_detections(con, tile_dets)
+            mark_tile_done(con, tile_id, n)
+            stats["total_detections"] += n
+            stats["tiles_processed"] += 1
+        except Exception as exc:
+            log.error(f"Writer failed for tile {tile_id}: {exc}")
+            stats["tiles_failed"] += 1
+        pbar.update(1)
+        pbar.set_postfix(
+            dets=stats["total_detections"],
+            ok=stats["tiles_processed"],
+            fail=stats["tiles_failed"],
+        )
+
+
 def run_pipeline(
     model_path: Path,
     output_db: Path,
@@ -107,6 +131,7 @@ def run_pipeline(
     min_elevation: float = 0,
     max_batch_tiles: int = 8,
     queue_maxsize: int = 0,
+    batch_timeout: float = 0.5,
 ) -> None:
     """Main pipeline: download+preprocess -> infer -> dedup -> store.
 
@@ -120,21 +145,13 @@ def run_pipeline(
         log.error("No tiles to process.")
         raise typer.Exit(code=1)
 
-    log.info(f"Loading model from {model_path} on {device} ...")
-    import torch
-    from ultralytics import YOLO
-    if not device:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    model = YOLO(model_path)
-    if device != "cpu":
-        model.to(device)
-
     if max_batch_tiles <= 0:
         max_batch_tiles = 8
 
     if queue_maxsize <= 0:
         queue_maxsize = download_threads * 3
 
+    # --- 1. Init DB, checkpoint filter ---
     con = init_db(output_db)
 
     done_set = get_processed_tiles(con)
@@ -146,7 +163,7 @@ def run_pipeline(
     if skipped:
         log.info(f"Checkpoint: skipping {skipped} already-processed tiles")
 
-    # Elevation pre-filter: download DSMs only, check max elevation
+    # --- 2. Elevation pre-filter ---
     elevation_skipped = 0
     if min_elevation > 0 and remaining:
         from concurrent.futures import ThreadPoolExecutor
@@ -176,6 +193,7 @@ def run_pipeline(
         con.close()
         return
 
+    # --- 3. Start producer (downloads tiles while model loads) ---
     tile_queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
 
     producer = threading.Thread(
@@ -185,66 +203,102 @@ def run_pipeline(
     )
     producer.start()
 
-    total_detections = 0
-    tiles_processed = 0
-    tiles_failed = 0
-    t0 = time.time()
+    # --- 4. Load YOLO model ---
+    log.info(f"Loading model from {model_path} on {device} ...")
+    import torch
+    from ultralytics import YOLO
+    if not device:
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    model = YOLO(model_path)
+    if device != "cpu":
+        model.to(device)
 
+    # --- 5. GPU warmup ---
+    if device != "cpu":
+        log.info("Warming up GPU ...")
+        dummy = torch.zeros(1, 3, TILE_SIZE_PX, TILE_SIZE_PX, device=device)
+        model.predict(
+            source=dummy, conf=conf, iou=iou, imgsz=TILE_SIZE_PX,
+            save=False, verbose=False,
+        )
+        del dummy
+        torch.cuda.empty_cache()
+
+    # --- 6. Start background DB writer ---
+    stats = {"total_detections": 0, "tiles_processed": 0, "tiles_failed": 0}
     pbar = tqdm(total=len(remaining), desc="Processing tiles", unit="tile")
+    write_queue: queue.Queue = queue.Queue()
 
+    writer = threading.Thread(
+        target=_writer_thread,
+        args=(con, write_queue, stats, pbar),
+        daemon=True,
+    )
+    writer.start()
+
+    t0 = time.time()
     max_patches = max_batch_tiles * 16  # 16 patches per tile
 
-    while True:
+    # --- 7. Consumer loop with timeout-based batch accumulation ---
+    sentinel_received = False
+
+    while not sentinel_received:
         batch: list[tuple[str, list]] = []
         batch_patches: list[tuple] = []
         tiles_in_batch = 0
 
-        item = tile_queue.get()
-        if item is None:
+        # Block indefinitely for the first tile
+        first = tile_queue.get()
+        if first is None:
             break
 
-        pending_items = [item]
-        while tiles_in_batch < max_batch_tiles:
-            if not pending_items:
-                try:
-                    nxt = tile_queue.get(block=False)
-                except queue.Empty:
-                    break
-                if nxt is None:
-                    pending_items.append(nxt)
-                    break
-                pending_items.append(nxt)
-                continue
+        pending = [first]
 
-            item = pending_items.pop(0)
-            if item is None:
-                pending_items.insert(0, None)
+        while tiles_in_batch < max_batch_tiles:
+            # Drain pending items
+            while pending and tiles_in_batch < max_batch_tiles:
+                item = pending.pop(0)
+                if item is None:
+                    sentinel_received = True
+                    break
+
+                coord, result = item
+                tile_id = coord.replace("-", "_")
+
+                if isinstance(result, Exception):
+                    stats["tiles_failed"] += 1
+                    log.warning(f"Tile {coord} failed: {result}")
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        dets=stats["total_detections"],
+                        ok=stats["tiles_processed"],
+                        fail=stats["tiles_failed"],
+                    )
+                    continue
+
+                patches = result
+                if not patches:
+                    write_queue.put((tile_id, []))
+                    continue
+
+                batch.append((tile_id, patches))
+                batch_patches.extend(patches)
+                tiles_in_batch += 1
+
+            if sentinel_received or tiles_in_batch >= max_batch_tiles:
                 break
 
-            coord, result = item
-            tile_id = coord.replace("-", "_")
-
-            if isinstance(result, Exception):
-                tiles_failed += 1
-                log.warning(f"Tile {coord} failed: {result}")
-                pbar.update(1)
-                continue
-
-            patches = result
-            if not patches:
-                mark_tile_done(con, tile_id, 0)
-                tiles_processed += 1
-                pbar.update(1)
-                continue
-
-            batch.append((tile_id, patches))
-            batch_patches.extend(patches)
-            tiles_in_batch += 1
+            # Wait for more tiles up to batch_timeout
+            try:
+                nxt = tile_queue.get(timeout=batch_timeout)
+            except queue.Empty:
+                break
+            pending.append(nxt)
 
         if not batch:
-            if pending_items and pending_items[0] is None:
-                break
             continue
+
+        log.debug(f"Batch: {tiles_in_batch} tiles, {len(batch_patches)} patches")
 
         detections = run_inference(
             model, batch_patches, conf=conf, iou=iou, device=device,
@@ -258,21 +312,19 @@ def run_pipeline(
 
         for tile_id, patches in batch:
             del patches
-            tile_dets = dedup_detections(det_by_tile.get(tile_id, []), distance_m=7.5)
-            n = write_detections(con, tile_dets)
-            mark_tile_done(con, tile_id, n)
-            total_detections += n
-            tiles_processed += 1
-            pbar.update(1)
-            pbar.set_postfix(dets=total_detections, ok=tiles_processed, fail=tiles_failed)
+            write_queue.put((tile_id, det_by_tile.get(tile_id, [])))
 
-        if pending_items and pending_items[0] is None:
-            break
+    # --- 8. Shutdown ---
+    write_queue.put(None)
+    writer.join()
 
     pbar.close()
     producer.join()
 
     elapsed = time.time() - t0
+    tiles_processed = stats["tiles_processed"]
+    tiles_failed = stats["tiles_failed"]
+    total_detections = stats["total_detections"]
     rate = tiles_processed / elapsed if elapsed > 0 else 0
 
     db_total = con.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
@@ -335,6 +387,7 @@ def run(
     cache_gb: float = typer.Option(10.0, help="Max tile cache size in GB (0 to disable)"),
     max_batch_tiles: int = typer.Option(8, help="Max tiles per GPU batch"),
     queue_size: int = typer.Option(0, help="Producer-consumer queue size (0=auto: download_threads*3)"),
+    batch_timeout: float = typer.Option(0.5, help="Seconds to wait for more tiles before running inference (0=no wait)"),
 ) -> None:
     """Run the nationwide rock detection pipeline."""
     init_cache(cache_dir, cache_gb)
@@ -375,4 +428,5 @@ def run(
         min_elevation=min_elevation,
         max_batch_tiles=max_batch_tiles,
         queue_maxsize=queue_size,
+        batch_timeout=batch_timeout,
     )

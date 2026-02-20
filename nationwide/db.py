@@ -1,11 +1,6 @@
-"""DuckDB storage: schema, checkpoint, detection writes."""
-
-from __future__ import annotations
-
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-
 import duckdb
 
 log = logging.getLogger(__name__)
@@ -86,7 +81,7 @@ def write_detections(
     ]
     con.executemany(
         "INSERT INTO detections "
-        "(tile_id, patch_id, easting, northing, confidence, bbox_w_m, bbox_h_m, class_id) "
+        "(tile_id, patch_id, easting, northing, confidence, bbox_w_m, bbox_h_m, class_id) "  # noqa
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )

@@ -1,13 +1,8 @@
-"""Caching: file-based LRU tile cache and STAC response cache (DuckDB)."""
-
-from __future__ import annotations
-
+import duckdb
 import logging
 import threading
 from pathlib import Path
 from urllib.parse import urlparse
-
-import duckdb
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +49,7 @@ class TileCache:
                 size = f.stat().st_size
                 f.unlink()
                 total -= size
-                log.debug("Cache evicted %s (%d MB)", f.name, size // 1_000_000)
+                log.debug("Cache evicted %s (%dMB)", f.name, size // 1_000_000)
 
 
 _tile_cache: TileCache | None = None
@@ -107,7 +102,7 @@ _stac_cache_path: Path | None = None
 
 
 def set_stac_cache_dir(cache_dir: Path) -> None:
-    """Set directory for the STAC response cache (call before query_stac_bbox)."""
+    """Set directory for the STAC response cache """
     global _stac_cache_path
     cache_dir.mkdir(parents=True, exist_ok=True)
     _stac_cache_path = cache_dir / "stac_cache.duckdb"
@@ -126,7 +121,7 @@ def load_stac_cache(bbox: str) -> list[tuple[str, str, str]] | None:
             con.close()
             return None
         tiles = con.execute(
-            "SELECT coord, rgb_url, dsm_url FROM stac_cache WHERE bbox = ? ORDER BY coord",
+            "SELECT coord, rgb_url, dsm_url FROM stac_cache WHERE bbox = ? ORDER BY coord",  # noqa
             [bbox],
         ).fetchall()
         con.close()
@@ -164,7 +159,7 @@ def save_stac_cache(bbox: str, tiles: list[tuple[str, str, str]]) -> None:
         con.execute("DELETE FROM stac_cache WHERE bbox = ?", [bbox])
         con.execute("DELETE FROM stac_cache_meta WHERE bbox = ?", [bbox])
         con.executemany(
-            "INSERT INTO stac_cache (bbox, coord, rgb_url, dsm_url) VALUES (?, ?, ?, ?)",
+            "INSERT INTO stac_cache (bbox, coord, rgb_url, dsm_url) VALUES (?, ?, ?, ?)",  # noqa
             [(bbox, c, r, d) for c, r, d in tiles],
         )
         con.execute(

@@ -1,19 +1,13 @@
-"""Tile processing: download, hillshade, crop, fuse, inference, dedup."""
-
-from __future__ import annotations
-
 import logging
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-
 import cv2
 import numpy as np
 import rasterio
 import rasterio.io
 import requests
 from requests.adapters import HTTPAdapter
-
 from nationwide.cache import cache_get, cache_put, reinit_cache
 from nationwide.db import Detection
 from utils.constants import (

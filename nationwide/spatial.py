@@ -1,19 +1,12 @@
-"""Tile discovery: STAC queries, HEAD-scan URL resolution."""
-
-from __future__ import annotations
-
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterator
-
 import requests
 from tqdm import tqdm
-
 from nationwide.cache import load_stac_cache, save_stac_cache
 from utils.constants import (
     COORD_RE, DSM_COLLECTION, DSM_TEMPLATE,
     SI_COLLECTION, SI_TEMPLATE, STAC_BASE,
-    SWITZERLAND_BBOX,
 )
 
 log = logging.getLogger(__name__)
@@ -80,7 +73,7 @@ def resolve_batch(
 def _stac_paginate(
     collection: str, bbox: str, limit: int = 100,
 ) -> Iterator[dict]:
-    """Yield all STAC items from a collection within a bbox, handling pagination."""
+    """Yield all STAC items from a collection within a bbox, w pagination."""
     url: str | None = f"{STAC_BASE}/collections/{collection}/items"
     params: dict = {"bbox": bbox, "limit": limit}
     while url:
