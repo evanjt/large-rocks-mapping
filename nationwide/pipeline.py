@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import logging
 import queue
 import threading
@@ -24,6 +23,7 @@ from nationwide.db import (
 )
 from nationwide.cache import get_cache_config, init_cache
 from nationwide.processing import (
+    check_elevation,
     dedup_detections,
     process_tile,
     reinit_session,
@@ -45,11 +45,11 @@ log = logging.getLogger(__name__)
 
 
 def _safe_process(
-    coord: str, rgb_url: str, dsm_url: str, min_elevation: float = 0,
+    coord: str, rgb_url: str, dsm_url: str,
 ) -> tuple[str, list | Exception]:
     """Process a single tile, catching exceptions for graceful error handling."""
     try:
-        return (coord, process_tile(coord, rgb_url, dsm_url, min_elevation=min_elevation))
+        return (coord, process_tile(coord, rgb_url, dsm_url))
     except Exception as exc:
         return (coord, exc)
 
@@ -58,7 +58,6 @@ def _producer_thread(
     tiles: list[tuple[str, str, str]],
     tile_queue: queue.Queue,
     download_threads: int,
-    min_elevation: float = 0,
 ) -> None:
     """Download+preprocess tiles in parallel processes, put results in queue.
 
@@ -79,7 +78,7 @@ def _producer_thread(
         for _ in range(download_threads):
             try:
                 c, r, d = next(src)
-                pending[pool.submit(_safe_process, c, r, d, min_elevation)] = True
+                pending[pool.submit(_safe_process, c, r, d)] = True
             except StopIteration:
                 break
 
@@ -93,7 +92,7 @@ def _producer_thread(
 
             try:
                 c, r, d = next(src)
-                pending[pool.submit(_safe_process, c, r, d, min_elevation)] = True
+                pending[pool.submit(_safe_process, c, r, d)] = True
             except StopIteration:
                 pass
 
@@ -149,6 +148,30 @@ def run_pipeline(
     skipped = len(tile_source) - len(remaining)
     if skipped:
         log.info(f"Checkpoint: skipping {skipped} already-processed tiles")
+
+    # Elevation pre-filter: download DSMs only, check max elevation
+    elevation_skipped = 0
+    if min_elevation > 0 and remaining:
+        from concurrent.futures import ThreadPoolExecutor
+
+        log.info(f"Checking elevations for {len(remaining)} tiles ...")
+
+        def _elev_ok(tile: tuple[str, str, str]) -> bool:
+            try:
+                return check_elevation(tile[2], min_elevation)
+            except Exception:
+                return True  # keep on error, let pipeline handle it
+
+        with ThreadPoolExecutor(max_workers=download_threads) as pool:
+            passes = list(tqdm(
+                pool.map(_elev_ok, remaining),
+                total=len(remaining), desc="Elevation filter", unit="tile",
+            ))
+        before = len(remaining)
+        remaining = [t for t, ok in zip(remaining, passes) if ok]
+        elevation_skipped = before - len(remaining)
+        log.info(f"Eliminated {elevation_skipped} tiles below {min_elevation:.0f}m")
+
     log.info(f"Tiles to process: {len(remaining)}")
 
     if not remaining:
@@ -160,7 +183,7 @@ def run_pipeline(
 
     producer = threading.Thread(
         target=_producer_thread,
-        args=(remaining, tile_queue, download_threads, min_elevation),
+        args=(remaining, tile_queue, download_threads),
         daemon=True,
     )
     producer.start()
@@ -170,30 +193,21 @@ def run_pipeline(
     tiles_failed = 0
     t0 = time.time()
 
-    t_wait_total = 0.0
-    t_infer_total = 0.0
-    t_post_total = 0.0
-    n_batches = 0
-    total_patches_inferred = 0
-
     pbar = tqdm(total=len(remaining), desc="Processing tiles", unit="tile")
 
-    MAX_BATCH_TILES = max_batch_tiles
-    max_patches = MAX_BATCH_TILES * 16  # 16 patches per tile
+    max_patches = max_batch_tiles * 16  # 16 patches per tile
 
     while True:
         batch: list[tuple[str, list]] = []
         batch_patches: list[tuple] = []
         tiles_in_batch = 0
 
-        t_wait_start = time.time()
         item = tile_queue.get()
-        t_wait_total += time.time() - t_wait_start
         if item is None:
             break
 
         pending_items = [item]
-        while tiles_in_batch < MAX_BATCH_TILES:
+        while tiles_in_batch < max_batch_tiles:
             if not pending_items:
                 try:
                     nxt = tile_queue.get(block=False)
@@ -235,16 +249,12 @@ def run_pipeline(
                 break
             continue
 
-        t_infer_start = time.time()
         detections = run_inference(
             model, batch_patches, conf=conf, iou=iou, device=device,
             max_patches_per_call=max_patches,
         )
-        t_infer_total += time.time() - t_infer_start
-        total_patches_inferred += len(batch_patches)
         del batch_patches
 
-        t_post_start = time.time()
         det_by_tile: dict[str, list] = defaultdict(list)
         for det in detections:
             det_by_tile[det.tile_id].append(det)
@@ -258,8 +268,6 @@ def run_pipeline(
             tiles_processed += 1
             pbar.update(1)
             pbar.set_postfix(dets=total_detections, ok=tiles_processed, fail=tiles_failed)
-        t_post_total += time.time() - t_post_start
-        n_batches += 1
 
         if pending_items and pending_items[0] is None:
             break
@@ -271,24 +279,43 @@ def run_pipeline(
     rate = tiles_processed / elapsed if elapsed > 0 else 0
 
     db_total = con.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
-    avg_batch = tiles_processed / n_batches if n_batches else 0
+
+    # Auto-export GPKG
+    gpkg_path = output_db.with_suffix(".gpkg")
+    rows = con.execute(
+        "SELECT tile_id, patch_id, easting, northing, confidence, "
+        "bbox_w_m, bbox_h_m, class_id FROM detections",
+    ).fetchall()
+    con.close()
+
+    if rows:
+        import geopandas as gpd
+        from shapely.geometry import box
+
+        records = []
+        for tile_id, patch_id, e, n, conf_val, w_m, h_m, cls in rows:
+            hw, hh = w_m / 2, h_m / 2
+            records.append({
+                "tile_id": tile_id,
+                "patch_id": patch_id,
+                "confidence": round(conf_val, 4),
+                "bbox_w_m": round(w_m, 2),
+                "bbox_h_m": round(h_m, 2),
+                "class_id": cls,
+                "geometry": box(e - hw, n - hh, e + hw, n + hh),
+            })
+        gdf = gpd.GeoDataFrame(records, crs="EPSG:2056")
+        gdf.to_file(gpkg_path, driver="GPKG", layer="rock_detections")
+
     log.info("=" * 60)
     log.info("Pipeline complete")
-    log.info(f"  Tiles processed: {tiles_processed}")
-    log.info(f"  Tiles failed:    {tiles_failed}")
-    log.info(f"  Tiles skipped:   {skipped}")
-    log.info(f"  Total detections: {total_detections}")
-    log.info(f"  DB total:        {db_total}")
-    log.info(f"  Time:            {elapsed:.0f}s ({rate:.2f} tiles/s)")
-    log.info(f"  Output:          {output_db}")
-    log.info(f"  Batch config:    max_batch_tiles={MAX_BATCH_TILES} ({max_patches} patches), queue={queue_maxsize}")
-    log.info(f"  Consumer timing ({n_batches} batches, avg {avg_batch:.1f} tiles/batch):")
-    log.info(f"    Queue wait:    {t_wait_total:.1f}s ({t_wait_total/elapsed*100:.0f}%)")
-    log.info(f"    Inference:     {t_infer_total:.1f}s ({t_infer_total/elapsed*100:.0f}%) [{total_patches_inferred} patches]")
-    log.info(f"    Dedup+write:   {t_post_total:.1f}s ({t_post_total/elapsed*100:.0f}%)")
+    log.info(f"  Tiles: {tiles_processed} processed, {tiles_failed} failed, {skipped} checkpointed, {elevation_skipped} below elevation")
+    log.info(f"  Detections: {total_detections} (DB total: {db_total})")
+    log.info(f"  Time: {elapsed:.0f}s ({rate:.2f} tiles/s)")
+    log.info(f"  Output: {output_db}")
+    if rows:
+        log.info(f"  GPKG:   {gpkg_path}")
     log.info("=" * 60)
-
-    con.close()
 
 
 # ── Typer CLI ────────────────────────────────────────────────────────────────
@@ -354,125 +381,3 @@ def run(
         max_batch_tiles=max_batch_tiles,
         queue_maxsize=queue_size,
     )
-
-
-@app.command()
-def export(
-    input_db: Path = typer.Option(..., "--input", help="DuckDB database path"),
-    output: Path = typer.Option(..., help="Output path (.gpkg or .geojson)"),
-    min_confidence: float = typer.Option(0.0, help="Minimum confidence filter"),
-    geometry: str = typer.Option("polygon", help="Geometry type: 'point' or 'polygon'"),
-) -> None:
-    """Export detections from DuckDB to GeoPackage or GeoJSON (EPSG:2056).
-
-    Format is detected from the output file extension:
-      .gpkg     → GeoPackage (default, recommended)
-      .geojson  → GeoJSON
-    """
-    import duckdb
-
-    if not input_db.exists():
-        log.error(f"Database not found: {input_db}")
-        raise typer.Exit(code=1)
-
-    ext = output.suffix.lower()
-    if ext not in (".gpkg", ".geojson", ".json"):
-        log.error(f"Unsupported output format '{ext}'. Use .gpkg or .geojson")
-        raise typer.Exit(code=1)
-
-    con = duckdb.connect(str(input_db), read_only=True)
-    rows = con.execute(
-        "SELECT tile_id, patch_id, easting, northing, confidence, "
-        "bbox_w_m, bbox_h_m, class_id FROM detections "
-        "WHERE confidence >= ? ORDER BY confidence DESC",
-        [min_confidence],
-    ).fetchall()
-    con.close()
-
-    if not rows:
-        log.error("No detections match the filter.")
-        raise typer.Exit(code=1)
-
-    use_polygon = geometry.lower().startswith("poly")
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    if ext == ".gpkg":
-        _export_gpkg(rows, output, use_polygon)
-    else:
-        _export_geojson(rows, output, use_polygon)
-
-    log.info(f"Exported {len(rows)} detections to {output} ({geometry}, EPSG:2056)")
-
-
-def _export_gpkg(
-    rows: list[tuple], output: Path, use_polygon: bool,
-) -> None:
-    """Write detections to a GeoPackage file."""
-    import geopandas as gpd
-    from shapely.geometry import Point, box
-
-    records = []
-    for tile_id, patch_id, e, n, conf, w_m, h_m, cls in rows:
-        if use_polygon:
-            hw, hh = w_m / 2, h_m / 2
-            geom = box(e - hw, n - hh, e + hw, n + hh)
-        else:
-            geom = Point(e, n)
-        records.append({
-            "tile_id": tile_id,
-            "patch_id": patch_id,
-            "confidence": round(conf, 4),
-            "bbox_w_m": round(w_m, 2),
-            "bbox_h_m": round(h_m, 2),
-            "class_id": cls,
-            "geometry": geom,
-        })
-
-    gdf = gpd.GeoDataFrame(records, crs="EPSG:2056")
-    gdf.to_file(output, driver="GPKG", layer="rock_detections")
-
-
-def _export_geojson(
-    rows: list[tuple], output: Path, use_polygon: bool,
-) -> None:
-    """Write detections to a GeoJSON file."""
-    features = []
-    for tile_id, patch_id, e, n, conf, w_m, h_m, cls in rows:
-        if use_polygon:
-            hw, hh = w_m / 2, h_m / 2
-            coords = [[
-                [e - hw, n - hh],
-                [e + hw, n - hh],
-                [e + hw, n + hh],
-                [e - hw, n + hh],
-                [e - hw, n - hh],
-            ]]
-            geom = {"type": "Polygon", "coordinates": coords}
-        else:
-            geom = {"type": "Point", "coordinates": [e, n]}
-
-        features.append({
-            "type": "Feature",
-            "geometry": geom,
-            "properties": {
-                "tile_id": tile_id,
-                "patch_id": patch_id,
-                "confidence": round(conf, 4),
-                "bbox_w_m": round(w_m, 2),
-                "bbox_h_m": round(h_m, 2),
-                "class_id": cls,
-            },
-        })
-
-    geojson = {
-        "type": "FeatureCollection",
-        "name": "rock_detections",
-        "crs": {
-            "type": "name",
-            "properties": {"name": "urn:ogc:def:crs:EPSG::2056"},
-        },
-        "features": features,
-    }
-
-    with open(output, "w") as f:
-        json.dump(geojson, f)

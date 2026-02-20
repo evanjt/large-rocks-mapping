@@ -227,6 +227,14 @@ def dedup_detections(
     return kept
 
 
+def check_elevation(dsm_url: str, min_elevation: float) -> bool:
+    """Download DSM tile and check if any point reaches min_elevation."""
+    dsm_bytes = download_to_memory(dsm_url)
+    with rasterio.io.MemoryFile(dsm_bytes) as memfile:
+        with memfile.open() as src:
+            return float(src.read(1).max()) >= min_elevation
+
+
 def process_tile(
     coord: str,
     rgb_url: str,
