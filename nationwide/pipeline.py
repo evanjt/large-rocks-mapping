@@ -298,7 +298,7 @@ def run_pipeline(
         if not batch:
             continue
 
-        log.debug(f"Batch: {tiles_in_batch} tiles, {len(batch_patches)} patches")
+        pbar.write(f"  >> Batch: {tiles_in_batch} tiles, {len(batch_patches)} patches")
 
         detections = run_inference(
             model, batch_patches, conf=conf, iou=iou, device=device,
