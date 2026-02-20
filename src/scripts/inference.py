@@ -12,76 +12,39 @@ Example usage:
 python src/inference.py --model models/baseline_best.pt --source data/inference/processed --output runs/inference --conf 0.10 --iou 0.40
 """
 
-
-def load_model(model_path, device="cuda:0"):
-    """Load YOLO model onto device. Returns (model, device_str)."""
-    model_path = Path(model_path)
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model not found: {model_path}")
-    device = (
-        device
-        if device
-        else ("cuda:0" if torch.cuda.is_available() else "cpu")
-    )
-    model = YOLO(model_path)
-    if device != "cpu":
-        model.to(device)
-    return model, device
-
-
-def predict_patches(
-    model, images, conf=0.10, iou=0.40, imgsz=640, device="cuda:0"
-):
-    """Run inference on a list of numpy arrays. Returns list of Results."""
-    return model.predict(
-        source=images,
-        conf=conf,
-        iou=iou,
-        imgsz=imgsz,
-        device=device,
-        save=False,
-        verbose=False,
-    )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser("YOLOv11 inference")
-    parser.add_argument("--model", required=True, help="Path to .pt weights")
-    parser.add_argument(
-        "--source", required=True, help="Image or folder of images"
-    )
-    parser.add_argument(
-        "--output", default="results", help="Folder to save YOLO outputs"
-    )
-    parser.add_argument(
-        "--conf", type=float, default=0.10, help="Confidence threshold"
-    )
-    parser.add_argument(
-        "--iou", type=float, default=0.40, help="IoU threshold"
-    )
-    parser.add_argument(
-        "--imgsz", type=int, default=640, help="Inference image size"
-    )
-    parser.add_argument("--device", default=0, help="'cpu', 'cuda:0', etc.")
+    parser.add_argument("--model", required=True,
+                        help="Path to .pt weights")
+    parser.add_argument("--source", required=True,
+                        help="Image or folder of images")
+    parser.add_argument("--output", default="results",
+                        help="Folder to save YOLO outputs")
+    parser.add_argument("--conf", type=float, default=0.10,
+                        help="Confidence threshold")
+    parser.add_argument("--iou", type=float, default=0.40,
+                        help="IoU threshold")
+    parser.add_argument("--imgsz", type=int, default=640,
+                        help="Inference image size")
+    parser.add_argument("--device", default=0,
+                        help="'cpu', 'cuda:0', etc.")
     args = parser.parse_args()
 
     # ---------------------- sanity-checks -----------------------------
-    model_path = Path(args.model)
+    model_path  = Path(args.model)
     source_path = Path(args.source)
     if not model_path.exists():
         sys.exit(f"Model not found: {model_path}")
     if not source_path.exists():
         sys.exit(f"Source not found: {source_path}")
 
-    device = (
-        args.device
-        if args.device
-        else ("cuda:0" if torch.cuda.is_available() else "cpu")
-    )
+    device = args.device if args.device else ("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # -------------------------- inference -----------------------------
-    model, device = load_model(model_path, device)
+    model = YOLO(model_path)
+    if device != "cpu":
+        model.to(device)
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -103,7 +66,6 @@ def main() -> None:
         show_conf=True,
     )
     print(f"Annotated images saved to {out_dir/'predict'}")
-
 
 if __name__ == "__main__":
     main()

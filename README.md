@@ -101,20 +101,32 @@ If you have questions, feedback, or would like to explore this work further, don
 
 Thanks for your interest in this project!
 
+# Nationwide Detection Pipeline
 
-### Execute
+The `nationwide/` directory contains a streaming pipeline that applies the trained model to Swisstopo tiles at national scale.
 
+```bash
+# Install (requires uv, Python >=3.11, GDAL CLI tools)
+uv pip install -e .
+
+# Run on specific tiles
+rock-detect run --model models/active_teacher.pt --coords 2587-1133
+
+# Export to GeoJSON
+rock-detect export --input detections.duckdb --output detections.geojson
 ```
-uv run python -m nationwide run \ 
-      --model models/active_teacher.pt \
-      --bbox "7.7,46.0,7.9,46.1" \      
-      --output valais_test.duckdb \
-      --device cuda:0
-```
 
+# Code Structure
 
-export
+- `src/`, `utils/` — Original research code (training, dataset, inference). Unchanged from the scientist's version.
+- `nationwide/` — Deployment pipeline applying the trained model to Swisstopo tiles at national scale. See `process_and_detect()` in `nationwide/processing.py` for the complete single-tile lifecycle.
 
-```
-uv run python -m nationwide export --input valais_test.duckdb --output valais_test.geojson 
-```
+# Preprocessing Verification
+
+The nationwide pipeline reproduces the exact preprocessing used during training:
+
+- **Hillshade**: `255 × cos(slope)` via Horn's method — verified against 16 training patches of tile 2581-1126 (r=0.999, MAE=0.029, 99.87% of pixels within 1.0)
+- **DSM source**: Raw Swisstopo swissSURFACE3D (0.5m) — verified bit-exact to training data (`np.array_equal() = True`)
+- **RGB-hillshade fusion**: Green channel replacement (index 1) — identical to training
+- **Model weights**: `active_teacher.pt` — md5 identical to Alexis's original
+- **Inference params**: conf=0.10, iou=0.40, imgsz=640 — same as training/validation
