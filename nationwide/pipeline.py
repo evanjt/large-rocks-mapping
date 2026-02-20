@@ -23,6 +23,7 @@ from nationwide.db import (
     write_detections,
 )
 from nationwide.cache import get_cache_config, init_cache, set_stac_cache_dir
+from utils.constants import SWITZERLAND_BBOX
 from nationwide.processing import (
     check_elevation,
     dedup_detections,
@@ -30,11 +31,7 @@ from nationwide.processing import (
     reinit_session,
     run_inference,
 )
-from nationwide.spatial import (
-    SWITZERLAND_BBOX,
-    query_stac_bbox,
-    resolve_batch,
-)
+from nationwide.spatial import query_stac_bbox, resolve_batch
 
 logging.basicConfig(
     level=logging.INFO,

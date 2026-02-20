@@ -17,19 +17,11 @@ from requests.adapters import HTTPAdapter
 from nationwide.cache import cache_get, cache_put, reinit_cache
 from nationwide.db import Detection
 from utils.constants import (
-    TILE_SIZE_PX, OVERLAP_PX, TARGET_RES,
-    SWISSIMAGE_RES, DSM_RES, FUSION_CHANNEL,
+    DSM_RES, FUSION_CHANNEL, SRC_CROP_DSM, SRC_CROP_RGB,
+    SRC_STRIDE_DSM, SRC_STRIDE_RGB, TILE_SIZE_PX,
 )
 
 log = logging.getLogger(__name__)
-
-TILE_GROUND_M = TILE_SIZE_PX * TARGET_RES               # 320m
-STRIDE_PX = TILE_SIZE_PX - OVERLAP_PX                   # 430px
-STRIDE_GROUND_M = STRIDE_PX * TARGET_RES                # 215m
-SRC_CROP_RGB = int(TILE_GROUND_M / SWISSIMAGE_RES)      # 3200px
-SRC_STRIDE_RGB = int(STRIDE_GROUND_M / SWISSIMAGE_RES)  # 2150px
-SRC_CROP_DSM = int(TILE_GROUND_M / DSM_RES)             # 640px
-SRC_STRIDE_DSM = int(STRIDE_GROUND_M / DSM_RES)         # 430px
 
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})

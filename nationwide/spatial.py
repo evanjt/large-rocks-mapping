@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterator
 
@@ -11,35 +10,13 @@ import requests
 from tqdm import tqdm
 
 from nationwide.cache import load_stac_cache, save_stac_cache
+from utils.constants import (
+    COORD_RE, DSM_COLLECTION, DSM_TEMPLATE,
+    SI_COLLECTION, SI_TEMPLATE, STAC_BASE,
+    SWITZERLAND_BBOX,
+)
 
 log = logging.getLogger(__name__)
-
-_SI_TEMPLATE = (
-    "https://data.geo.admin.ch/ch.swisstopo.swissimage-dop10/"
-    "swissimage-dop10_{year}_{coord}/"
-    "swissimage-dop10_{year}_{coord}_0.1_2056.tif"
-)
-
-_DSM_TEMPLATE = (
-    "https://data.geo.admin.ch/ch.swisstopo.swisssurface3d-raster/"
-    "swisssurface3d-raster_{year}_{coord}/"
-    "swisssurface3d-raster_{year}_{coord}_0.5_2056_5728.tif"
-)
-
-_STAC_BASE = "https://data.geo.admin.ch/api/stac/v0.9"
-_SI_COLLECTION = "ch.swisstopo.swissimage-dop10"
-_DSM_COLLECTION = "ch.swisstopo.swisssurface3d-raster"
-
-_COORD_RE = re.compile(r"(\d{4}-\d{4})")
-
-# Union of SwissIMAGE + swissSURFACE3D spatial extents (WGS84), from:
-#   GET https://data.geo.admin.ch/api/stac/v0.9/collections/{collection}
-#   → extent.spatial.bbox
-# SwissIMAGE:     [5.9503666, 45.8151271, 10.4998461, 47.8091281]
-# swissSURFACE3D: [5.9503666, 45.7213375, 10.4998461, 47.8216742]
-# We use the union so the STAC query returns all tiles from both layers;
-# query_stac_bbox() then intersects the results to keep only matched pairs.
-SWITZERLAND_BBOX = "5.95,45.72,10.50,47.83"
 
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
@@ -67,10 +44,10 @@ def resolve_tile_urls(
 
     Returns (rgb_url, dsm_url) or None if either is missing.
     """
-    rgb_url = _find_latest_url(_SI_TEMPLATE, coord, max_year)
+    rgb_url = _find_latest_url(SI_TEMPLATE, coord, max_year)
     if rgb_url is None:
         return None
-    dsm_url = _find_latest_url(_DSM_TEMPLATE, coord, max_year)
+    dsm_url = _find_latest_url(DSM_TEMPLATE, coord, max_year)
     if dsm_url is None:
         return None
     return (rgb_url, dsm_url)
@@ -104,7 +81,7 @@ def _stac_paginate(
     collection: str, bbox: str, limit: int = 100,
 ) -> Iterator[dict]:
     """Yield all STAC items from a collection within a bbox, handling pagination."""
-    url: str | None = f"{_STAC_BASE}/collections/{collection}/items"
+    url: str | None = f"{STAC_BASE}/collections/{collection}/items"
     params: dict = {"bbox": bbox, "limit": limit}
     while url:
         resp = _SESSION.get(url, params=params, timeout=30)
@@ -128,7 +105,7 @@ def _extract_stac_tiles(items: Iterator[dict]) -> dict[str, str]:
     result: dict[str, str] = {}
     for item in items:
         item_id = item.get("id", "")
-        m = _COORD_RE.search(item_id)
+        m = COORD_RE.search(item_id)
         if not m:
             continue
         coord = m.group(1)
@@ -160,11 +137,11 @@ def query_stac_bbox(bbox: str) -> list[tuple[str, str, str]]:
         return cached
 
     log.info(f"Querying STAC for SwissIMAGE tiles in bbox={bbox} ...")
-    rgb_tiles = _extract_stac_tiles(_stac_paginate(_SI_COLLECTION, bbox))
+    rgb_tiles = _extract_stac_tiles(_stac_paginate(SI_COLLECTION, bbox))
     log.info(f"  Found {len(rgb_tiles)} SwissIMAGE tiles")
 
     log.info(f"Querying STAC for swissSURFACE3D tiles in bbox={bbox} ...")
-    dsm_tiles = _extract_stac_tiles(_stac_paginate(_DSM_COLLECTION, bbox))
+    dsm_tiles = _extract_stac_tiles(_stac_paginate(DSM_COLLECTION, bbox))
     log.info(f"  Found {len(dsm_tiles)} swissSURFACE3D tiles")
 
     common = sorted(set(rgb_tiles) & set(dsm_tiles))
