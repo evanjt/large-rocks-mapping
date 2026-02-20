@@ -5,92 +5,14 @@ from __future__ import annotations
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from typing import Iterator
 
-import duckdb
 import requests
 from tqdm import tqdm
 
+from nationwide.cache import load_stac_cache, save_stac_cache
+
 log = logging.getLogger(__name__)
-
-# ── STAC cache (DuckDB in cache dir) ─────────────────────────────────────────
-
-_stac_cache_path: Path | None = None
-
-
-def set_stac_cache_dir(cache_dir: Path) -> None:
-    """Set directory for the STAC response cache (call before query_stac_bbox)."""
-    global _stac_cache_path
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    _stac_cache_path = cache_dir / "stac_cache.duckdb"
-
-
-def _load_stac_cache(bbox: str) -> list[tuple[str, str, str]] | None:
-    """Load cached STAC results for the given bbox, or None if not cached."""
-    if _stac_cache_path is None or not _stac_cache_path.exists():
-        return None
-    try:
-        con = duckdb.connect(str(_stac_cache_path), read_only=True)
-        row = con.execute(
-            "SELECT n_tiles FROM stac_cache_meta WHERE bbox = ?", [bbox],
-        ).fetchone()
-        if row is None:
-            con.close()
-            return None
-        tiles = con.execute(
-            "SELECT coord, rgb_url, dsm_url FROM stac_cache WHERE bbox = ? ORDER BY coord",
-            [bbox],
-        ).fetchall()
-        con.close()
-        if len(tiles) != row[0]:
-            log.warning("STAC cache count mismatch, re-querying")
-            return None
-        return [(c, r, d) for c, r, d in tiles]
-    except Exception as exc:
-        log.warning(f"STAC cache read failed: {exc}")
-        return None
-
-
-def _save_stac_cache(bbox: str, tiles: list[tuple[str, str, str]]) -> None:
-    """Persist STAC results to the cache DuckDB."""
-    if _stac_cache_path is None:
-        return
-    try:
-        con = duckdb.connect(str(_stac_cache_path))
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS stac_cache (
-                bbox     VARCHAR,
-                coord    VARCHAR,
-                rgb_url  VARCHAR NOT NULL,
-                dsm_url  VARCHAR NOT NULL,
-                PRIMARY KEY (bbox, coord)
-            )
-        """)
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS stac_cache_meta (
-                bbox       VARCHAR PRIMARY KEY,
-                n_tiles    INTEGER,
-                cached_at  TIMESTAMP DEFAULT current_timestamp
-            )
-        """)
-        # Replace any existing cache for this bbox
-        con.execute("DELETE FROM stac_cache WHERE bbox = ?", [bbox])
-        con.execute("DELETE FROM stac_cache_meta WHERE bbox = ?", [bbox])
-        con.executemany(
-            "INSERT INTO stac_cache (bbox, coord, rgb_url, dsm_url) VALUES (?, ?, ?, ?)",
-            [(bbox, c, r, d) for c, r, d in tiles],
-        )
-        con.execute(
-            "INSERT INTO stac_cache_meta (bbox, n_tiles) VALUES (?, ?)",
-            [bbox, len(tiles)],
-        )
-        con.close()
-        log.info(f"STAC cache saved: {len(tiles)} tile pairs for bbox={bbox}")
-    except Exception as exc:
-        log.warning(f"STAC cache write failed: {exc}")
-
-# ── Swisstopo endpoints ─────────────────────────────────────────────────────
 
 _SI_TEMPLATE = (
     "https://data.geo.admin.ch/ch.swisstopo.swissimage-dop10/"
@@ -122,8 +44,6 @@ SWITZERLAND_BBOX = "5.95,45.72,10.50,47.83"
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
 
-
-# ── HEAD-scan URL resolution (used for --coords) ────────────────────────────
 
 def _find_latest_url(
     template: str, coord: str, max_year: int = 2026, min_year: int = 2017,
@@ -180,8 +100,6 @@ def resolve_batch(
     return results
 
 
-# ── STAC tile discovery (used for --bbox) ────────────────────────────────────
-
 def _stac_paginate(
     collection: str, bbox: str, limit: int = 100,
 ) -> Iterator[dict]:
@@ -236,7 +154,7 @@ def query_stac_bbox(bbox: str) -> list[tuple[str, str, str]]:
     Returns:
         List of (coord, rgb_url, dsm_url) tuples.
     """
-    cached = _load_stac_cache(bbox)
+    cached = load_stac_cache(bbox)
     if cached is not None:
         log.info(f"STAC cache hit: {len(cached)} tile pairs for bbox={bbox}")
         return cached
@@ -253,5 +171,5 @@ def query_stac_bbox(bbox: str) -> list[tuple[str, str, str]]:
     log.info(f"  Matched pairs: {len(common)}")
 
     result = [(c, rgb_tiles[c], dsm_tiles[c]) for c in common]
-    _save_stac_cache(bbox, result)
+    save_stac_cache(bbox, result)
     return result

@@ -15,6 +15,7 @@ from ultralytics.utils.ops import non_max_suppression
 from ultralytics.utils.torch_utils import ModelEMA
 
 from active_teacher_datasets import UnlabeledDataset, PseudoLabelDataset
+from utils.constants import TILE_SIZE_PX
 from utils.helpers import validate_model
 
 """
@@ -95,7 +96,7 @@ def main():
     student.model.args['batch'] = batch_size
     student.model.args['data'] = cfg_path
     student.model.args['optimizer'] = 'AdamW'
-    student.model.args['imgsz'] = 640
+    student.model.args['imgsz'] = TILE_SIZE_PX
     student.model.args['single_cls'] = True
     student.model.args['box'] = 7.5
     student.model.args['cls'] = 0.5

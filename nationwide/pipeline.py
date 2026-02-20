@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
 import queue
 import threading
 import time
@@ -21,7 +22,7 @@ from nationwide.db import (
     mark_tile_done,
     write_detections,
 )
-from nationwide.cache import get_cache_config, init_cache
+from nationwide.cache import get_cache_config, init_cache, set_stac_cache_dir
 from nationwide.processing import (
     check_elevation,
     dedup_detections,
@@ -33,7 +34,6 @@ from nationwide.spatial import (
     SWITZERLAND_BBOX,
     query_stac_bbox,
     resolve_batch,
-    set_stac_cache_dir,
 )
 
 logging.basicConfig(
@@ -162,7 +162,7 @@ def run_pipeline(
             except Exception:
                 return True  # keep on error, let pipeline handle it
 
-        with ThreadPoolExecutor(max_workers=download_threads) as pool:
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
             passes = list(tqdm(
                 pool.map(_elev_ok, remaining),
                 total=len(remaining), desc="Elevation filter", unit="tile",
@@ -317,8 +317,6 @@ def run_pipeline(
         log.info(f"  GPKG:   {gpkg_path}")
     log.info("=" * 60)
 
-
-# ── Typer CLI ────────────────────────────────────────────────────────────────
 
 app = typer.Typer(help="Nationwide rock detection pipeline.")
 

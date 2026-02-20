@@ -10,11 +10,12 @@ import cv2
 import torch
 from ultralytics.utils.ops import non_max_suppression, xywhn2xyxy
 from ultralytics.utils.metrics import ConfusionMatrix
+from utils.constants import TILE_SIZE_PX
 
 
 # --------------- DATA PREPROCESSING ----------------
 
-def convert_annotation_to_yolo(annotation, patch_size=640, bbox_width=16, bbox_height=16):
+def convert_annotation_to_yolo(annotation, patch_size=TILE_SIZE_PX, bbox_width=16, bbox_height=16):
     """
     Convert a single annotation to YOLO format.
     """
@@ -25,7 +26,7 @@ def convert_annotation_to_yolo(annotation, patch_size=640, bbox_width=16, bbox_h
     return f"{class_id} {center_x:.6f} {center_y:.6f} {rel_width:.6f} {rel_height:.6f}"
 
 
-def create_yolo_annotation_files(dataset, output_dir, patch_size=640, bbox_width=32, bbox_height=32):
+def create_yolo_annotation_files(dataset, output_dir, patch_size=TILE_SIZE_PX, bbox_width=32, bbox_height=32):
     """
     Generate YOLO-format annotation files (the .txt files) for each image patch in the given dataset.
     """
@@ -46,7 +47,7 @@ def create_yolo_annotation_files(dataset, output_dir, patch_size=640, bbox_width
                 f.write(yolo_line + "\n")
 
 
-def prepare_yolo_training_files(dataset, root_dest_dir, split, patch_size=640, bbox_width=32, bbox_height=32):
+def prepare_yolo_training_files(dataset, root_dest_dir, split, patch_size=TILE_SIZE_PX, bbox_width=32, bbox_height=32):
 
     # destination directories for each split
     dest_images_dir = root_dest_dir  / "images" / split
@@ -75,7 +76,7 @@ def prepare_yolo_training_files(dataset, root_dest_dir, split, patch_size=640, b
     
     print("YOLO data preparation complete for split.")
 
-def prepare_yolo_training_files_all_splits(train_samples, val_samples, test_samples, patch_size=640, bbox_width=32, bbox_height=32):
+def prepare_yolo_training_files_all_splits(train_samples, val_samples, test_samples, patch_size=TILE_SIZE_PX, bbox_width=32, bbox_height=32):
     root_dest_dir = paths.PROCESSED_DATA_DIR
     root_dest_dir.mkdir(parents=True, exist_ok=True)
     prepare_yolo_training_files(train_samples, root_dest_dir, "train", patch_size, bbox_width, bbox_height)

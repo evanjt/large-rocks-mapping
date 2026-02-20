@@ -16,16 +16,12 @@ from requests.adapters import HTTPAdapter
 
 from nationwide.cache import cache_get, cache_put, reinit_cache
 from nationwide.db import Detection
+from utils.constants import (
+    TILE_SIZE_PX, OVERLAP_PX, TARGET_RES,
+    SWISSIMAGE_RES, DSM_RES, FUSION_CHANNEL,
+)
 
 log = logging.getLogger(__name__)
-
-# Patch geometry constants (match training data)
-TILE_SIZE_PX = 640
-OVERLAP_PX = 210
-TARGET_RES = 0.5          # m/pixel (output)
-SWISSIMAGE_RES = 0.1      # m/pixel (source RGB)
-DSM_RES = 0.5             # m/pixel (source DSM)
-FUSION_CHANNEL = 1        # Replace green channel
 
 TILE_GROUND_M = TILE_SIZE_PX * TARGET_RES               # 320m
 STRIDE_PX = TILE_SIZE_PX - OVERLAP_PX                   # 430px

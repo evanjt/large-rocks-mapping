@@ -5,6 +5,7 @@ from typing import List
 from torch.utils.data import Dataset
 from torchvision import transforms
 from ultralytics.utils.ops import xyxy2xywhn
+from utils.constants import TILE_SIZE_PX
 
 """
 Custom datasets for semi-supervised Active Teacher training.
@@ -17,7 +18,7 @@ These are used to dynamically manage the growing pseudo-labeled dataset across i
 
 class UnlabeledDataset(Dataset):
         
-    def __init__(self, img_dir: str, imgsz = 640):
+    def __init__(self, img_dir: str, imgsz=TILE_SIZE_PX):
         # collect all img file paths
         self.img_paths: List[str] = [
             os.path.join(img_dir, fn)
@@ -95,7 +96,7 @@ class UnlabeledDataset(Dataset):
 
 class PseudoLabelDataset(Dataset):
 
-    def __init__(self, img_paths: list[str], preds: list[torch.Tensor], imgsz=640):
+    def __init__(self, img_paths: list[str], preds: list[torch.Tensor], imgsz=TILE_SIZE_PX):
         assert len(img_paths) == len(preds), "images / preds length mismatch"
         # sort for deterministic indexing
         self.img_paths = img_paths

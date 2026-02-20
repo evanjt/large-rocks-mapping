@@ -1,5 +1,8 @@
 import argparse
 
+from utils.constants import TILE_SIZE_PX
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="YOLO Training Script Argument Parser"
@@ -181,7 +184,7 @@ def parse_args():
     parser.add_argument(
         '--imgsz',
         type=int,
-        default=640,
+        default=TILE_SIZE_PX,
         help="Image size for training (default: 640)."
     )
     parser.add_argument(

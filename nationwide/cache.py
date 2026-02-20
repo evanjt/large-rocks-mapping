@@ -1,4 +1,4 @@
-"""File-based LRU tile cache for downloaded Swisstopo tiles."""
+"""Caching: file-based LRU tile cache and STAC response cache (DuckDB)."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import logging
 import threading
 from pathlib import Path
 from urllib.parse import urlparse
+
+import duckdb
 
 log = logging.getLogger(__name__)
 
@@ -97,3 +99,79 @@ def cache_put(url: str, data: bytes) -> None:
     """Store downloaded bytes in the cache."""
     if _tile_cache is not None:
         _tile_cache.put(url, data)
+
+
+# --- STAC response cache (DuckDB) ---
+
+_stac_cache_path: Path | None = None
+
+
+def set_stac_cache_dir(cache_dir: Path) -> None:
+    """Set directory for the STAC response cache (call before query_stac_bbox)."""
+    global _stac_cache_path
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _stac_cache_path = cache_dir / "stac_cache.duckdb"
+
+
+def load_stac_cache(bbox: str) -> list[tuple[str, str, str]] | None:
+    """Load cached STAC results for the given bbox, or None if not cached."""
+    if _stac_cache_path is None or not _stac_cache_path.exists():
+        return None
+    try:
+        con = duckdb.connect(str(_stac_cache_path), read_only=True)
+        row = con.execute(
+            "SELECT n_tiles FROM stac_cache_meta WHERE bbox = ?", [bbox],
+        ).fetchone()
+        if row is None:
+            con.close()
+            return None
+        tiles = con.execute(
+            "SELECT coord, rgb_url, dsm_url FROM stac_cache WHERE bbox = ? ORDER BY coord",
+            [bbox],
+        ).fetchall()
+        con.close()
+        if len(tiles) != row[0]:
+            log.warning("STAC cache count mismatch, re-querying")
+            return None
+        return [(c, r, d) for c, r, d in tiles]
+    except Exception as exc:
+        log.warning(f"STAC cache read failed: {exc}")
+        return None
+
+
+def save_stac_cache(bbox: str, tiles: list[tuple[str, str, str]]) -> None:
+    """Persist STAC results to the cache DuckDB."""
+    if _stac_cache_path is None:
+        return
+    try:
+        con = duckdb.connect(str(_stac_cache_path))
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS stac_cache (
+                bbox     VARCHAR,
+                coord    VARCHAR,
+                rgb_url  VARCHAR NOT NULL,
+                dsm_url  VARCHAR NOT NULL,
+                PRIMARY KEY (bbox, coord)
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS stac_cache_meta (
+                bbox       VARCHAR PRIMARY KEY,
+                n_tiles    INTEGER,
+                cached_at  TIMESTAMP DEFAULT current_timestamp
+            )
+        """)
+        con.execute("DELETE FROM stac_cache WHERE bbox = ?", [bbox])
+        con.execute("DELETE FROM stac_cache_meta WHERE bbox = ?", [bbox])
+        con.executemany(
+            "INSERT INTO stac_cache (bbox, coord, rgb_url, dsm_url) VALUES (?, ?, ?, ?)",
+            [(bbox, c, r, d) for c, r, d in tiles],
+        )
+        con.execute(
+            "INSERT INTO stac_cache_meta (bbox, n_tiles) VALUES (?, ?)",
+            [bbox, len(tiles)],
+        )
+        con.close()
+        log.info(f"STAC cache saved: {len(tiles)} tile pairs for bbox={bbox}")
+    except Exception as exc:
+        log.warning(f"STAC cache write failed: {exc}")
