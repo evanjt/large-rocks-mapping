@@ -10,9 +10,10 @@ import requests
 from requests.adapters import HTTPAdapter
 from nationwide.cache import cache_get, cache_put, reinit_cache
 from nationwide.db import Detection
+from rasterio.enums import Resampling
 from utils.constants import (
-    DSM_RES, FUSION_CHANNEL, SRC_CROP_DSM, SRC_CROP_RGB,
-    SRC_STRIDE_DSM, SRC_STRIDE_RGB, TILE_SIZE_PX,
+    DSM_RES, FUSION_CHANNEL, SRC_CROP_DSM,
+    SRC_STRIDE_DSM, SWISSIMAGE_RES, TARGET_RES, TILE_SIZE_PX,
 )
 
 log = logging.getLogger(__name__)
@@ -80,8 +81,7 @@ def generate_hillshade(
         - (padded[2:, :-2] + 2 * padded[2:, 1:-1] + padded[2:, 2:])
     ) / (8.0 * res)
 
-    slope_rad = np.arctan(np.sqrt(dzdx**2 + dzdy**2))
-    shade = np.cos(slope_rad)
+    shade = 1.0 / np.sqrt(1.0 + dzdx**2 + dzdy**2)
 
     shade = np.clip(shade * 255.0, 0, 255).astype(np.uint8)
     return shade
@@ -260,15 +260,22 @@ def process_tile(
 
     with rasterio.io.MemoryFile(rgb_bytes) as memfile:
         with memfile.open() as src:
-            rgb_data = src.read()
-            rgb_transform = src.transform
+            bands = min(src.count, 3)
+            target_h = int(src.height * SWISSIMAGE_RES / TARGET_RES)
+            target_w = int(src.width * SWISSIMAGE_RES / TARGET_RES)
+            rgb_data = src.read(
+                indexes=list(range(1, bands + 1)),
+                out_shape=(bands, target_h, target_w),
+                resampling=Resampling.bilinear,
+            )
+            rgb_transform = src.transform * src.transform.scale(
+                src.width / target_w, src.height / target_h,
+            )
     del rgb_bytes
-    if rgb_data.shape[0] > 3:
-        rgb_data = rgb_data[:3]
 
     rgb_patches = crop_patches(
         rgb_data, rgb_transform,
-        crop_px=SRC_CROP_RGB, stride_px=SRC_STRIDE_RGB, out_px=TILE_SIZE_PX,
+        crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM, out_px=TILE_SIZE_PX,
     )
     del rgb_data
 
@@ -281,10 +288,71 @@ def process_tile(
     for (hs_patch, hs_tf, row, col), (rgb_patch, _, _, _) in zip(
         hs_patches, rgb_patches,
     ):
-        fused = fuse_rgb_hillshade(rgb_patch, hs_patch, FUSION_CHANNEL)
-        results.append((fused, hs_tf, row, col, tile_id))
+        rgb_patch[FUSION_CHANNEL] = hs_patch
+        results.append((rgb_patch, hs_tf, row, col, tile_id))
 
     return results
+
+
+def build_batch_tensor(
+    patches: list[tuple[np.ndarray, rasterio.Affine, int, int, str]],
+    device: str = "cuda:0",
+) -> tuple:
+    """Stack patches into a GPU-ready float tensor. Returns (tensor, meta_list).
+
+    This is the CPU-bound half of inference: np.stack + float conversion + H2D
+    transfer. Designed to run on the main thread while the GPU processes the
+    previous batch in a background thread.
+    """
+    import torch
+
+    meta = []
+    arrays = []
+    for patch_data, transform, row, col, tile_id in patches:
+        arrays.append(patch_data)
+        meta.append((transform, row, col, tile_id))
+    batch = torch.from_numpy(np.stack(arrays)).float().div_(255.0).to(device)
+    return batch, meta
+
+
+def infer_on_tensor(
+    model,
+    batch,
+    meta: list,
+    conf: float = 0.10,
+    iou: float = 0.40,
+) -> list[Detection]:
+    """Run YOLO predict on a pre-built GPU tensor, extract detections.
+
+    This is the GPU-bound half of inference. PyTorch releases the GIL during
+    CUDA kernels, so this can run in a background thread while the main thread
+    builds the next tensor on CPU.
+    """
+    results = model.predict(
+        source=batch, conf=conf, iou=iou, imgsz=TILE_SIZE_PX,
+        save=False, verbose=False,
+    )
+    detections = []
+    for result, (transform, row, col, tile_id) in zip(results, meta):
+        boxes = result.boxes
+        if boxes is None or len(boxes) == 0:
+            continue
+        patch_id = f"{tile_id}_{row}_{col}"
+        for i in range(len(boxes)):
+            xywhn = boxes.xywhn[i].cpu().numpy()
+            cx, cy, w, h = xywhn
+            conf_val = float(boxes.conf[i].cpu())
+            cls = int(boxes.cls[i].cpu())
+            easting, northing, w_m, h_m = yolo_to_map_coords(
+                cx, cy, w, h, TILE_SIZE_PX, transform,
+            )
+            detections.append(Detection(
+                tile_id=tile_id, patch_id=patch_id,
+                easting=float(easting), northing=float(northing),
+                confidence=conf_val, bbox_w_m=float(w_m), bbox_h_m=float(h_m),
+                class_id=cls,
+            ))
+    return detections
 
 
 def run_inference(

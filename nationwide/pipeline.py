@@ -20,8 +20,10 @@ from nationwide.db import (
 from nationwide.cache import get_cache_config, init_cache, set_stac_cache_dir
 from utils.constants import SWITZERLAND_BBOX, TILE_SIZE_PX
 from nationwide.processing import (
+    build_batch_tensor,
     check_elevation,
     dedup_detections,
+    infer_on_tensor,
     process_tile,
     reinit_session,
     run_inference,
@@ -118,6 +120,75 @@ def _writer_thread(
             ok=stats["tiles_processed"],
             fail=stats["tiles_failed"],
         )
+
+
+def _collect_batch(
+    tile_queue: queue.Queue,
+    max_tiles: int,
+    batch_timeout: float,
+    stats: dict,
+    pbar,
+    write_queue: queue.Queue,
+) -> tuple[list[tuple[str, list]], list[tuple], bool]:
+    """Drain up to max_tiles from queue. Returns (batch, patches, sentinel_received).
+
+    Blocks on the first tile, then drains with timeout for the rest.
+    Handles failures (log + update stats) and empty tiles (send to writer).
+    """
+    batch: list[tuple[str, list]] = []
+    batch_patches: list[tuple] = []
+    tiles_in_batch = 0
+    sentinel_received = False
+
+    # Block indefinitely for the first tile
+    first = tile_queue.get()
+    if first is None:
+        return batch, batch_patches, True
+
+    pending = [first]
+
+    while tiles_in_batch < max_tiles:
+        # Drain pending items
+        while pending and tiles_in_batch < max_tiles:
+            item = pending.pop(0)
+            if item is None:
+                sentinel_received = True
+                break
+
+            coord, result = item
+            tile_id = coord.replace("-", "_")
+
+            if isinstance(result, Exception):
+                stats["tiles_failed"] += 1
+                log.warning(f"Tile {coord} failed: {result}")
+                pbar.update(1)
+                pbar.set_postfix(
+                    dets=stats["total_detections"],
+                    ok=stats["tiles_processed"],
+                    fail=stats["tiles_failed"],
+                )
+                continue
+
+            patches = result
+            if not patches:
+                write_queue.put((tile_id, []))
+                continue
+
+            batch.append((tile_id, patches))
+            batch_patches.extend(patches)
+            tiles_in_batch += 1
+
+        if sentinel_received or tiles_in_batch >= max_tiles:
+            break
+
+        # Wait for more tiles up to batch_timeout
+        try:
+            nxt = tile_queue.get(timeout=batch_timeout)
+        except queue.Empty:
+            break
+        pending.append(nxt)
+
+    return batch, batch_patches, sentinel_received
 
 
 def run_pipeline(
@@ -237,75 +308,62 @@ def run_pipeline(
     writer.start()
 
     t0 = time.time()
-    max_patches = max_batch_tiles * 16  # 16 patches per tile
 
-    # --- 7. Consumer loop with timeout-based batch accumulation ---
-    sentinel_received = False
+    # --- 7. Double-buffered consumer loop ---
+    # While GPU runs predict() on batch N, the main thread collects tiles
+    # and builds the tensor for batch N+1.  PyTorch releases the GIL during
+    # CUDA kernels, so a background thread can drive the GPU concurrently.
+    from concurrent.futures import ThreadPoolExecutor as _InferPool
 
-    while not sentinel_received:
-        batch: list[tuple[str, list]] = []
-        batch_patches: list[tuple] = []
-        tiles_in_batch = 0
+    infer_executor = _InferPool(max_workers=1)
 
-        # Block indefinitely for the first tile
-        first = tile_queue.get()
-        if first is None:
-            break
+    # Prefetch first batch
+    batch, batch_patches, sentinel_received = _collect_batch(
+        tile_queue, max_batch_tiles, batch_timeout, stats, pbar, write_queue,
+    )
+    if batch_patches:
+        tensor, meta = build_batch_tensor(batch_patches, device)
+    else:
+        tensor, meta = None, None
 
-        pending = [first]
+    while batch:
+        pbar.write(f"  >> Batch: {len(batch)} tiles, {len(batch_patches)} patches")
 
-        while tiles_in_batch < max_batch_tiles:
-            # Drain pending items
-            while pending and tiles_in_batch < max_batch_tiles:
-                item = pending.pop(0)
-                if item is None:
-                    sentinel_received = True
-                    break
-
-                coord, result = item
-                tile_id = coord.replace("-", "_")
-
-                if isinstance(result, Exception):
-                    stats["tiles_failed"] += 1
-                    log.warning(f"Tile {coord} failed: {result}")
-                    pbar.update(1)
-                    pbar.set_postfix(
-                        dets=stats["total_detections"],
-                        ok=stats["tiles_processed"],
-                        fail=stats["tiles_failed"],
-                    )
-                    continue
-
-                patches = result
-                if not patches:
-                    write_queue.put((tile_id, []))
-                    continue
-
-                batch.append((tile_id, patches))
-                batch_patches.extend(patches)
-                tiles_in_batch += 1
-
-            if sentinel_received or tiles_in_batch >= max_batch_tiles:
-                break
-
-            # Wait for more tiles up to batch_timeout
-            try:
-                nxt = tile_queue.get(timeout=batch_timeout)
-            except queue.Empty:
-                break
-            pending.append(nxt)
-
-        if not batch:
-            continue
-
-        pbar.write(f"  >> Batch: {tiles_in_batch} tiles, {len(batch_patches)} patches")
-
-        detections = run_inference(
-            model, batch_patches, conf=conf, iou=iou, device=device,
-            max_patches_per_call=max_patches,
+        # Submit inference to background thread (GIL released during CUDA)
+        infer_future = infer_executor.submit(
+            infer_on_tensor, model, tensor, meta, conf, iou,
         )
-        del batch_patches
 
+        # While GPU works: collect + prepare next batch on CPU
+        if not sentinel_received:
+            next_batch, next_patches, sentinel_received = _collect_batch(
+                tile_queue, max_batch_tiles, batch_timeout,
+                stats, pbar, write_queue,
+            )
+            if next_patches:
+                next_tensor, next_meta = build_batch_tensor(next_patches, device)
+            else:
+                next_tensor, next_meta = None, None
+        else:
+            next_batch, next_patches = [], []
+            next_tensor, next_meta = None, None
+
+        # Wait for inference result
+        try:
+            detections = infer_future.result()
+        except (RuntimeError, Exception) as exc:
+            if "out of memory" in str(exc).lower():
+                import torch
+                torch.cuda.empty_cache()
+                log.warning("OOM in double-buffer, falling back to run_inference")
+                detections = run_inference(
+                    model, batch_patches, conf=conf, iou=iou, device=device,
+                    max_patches_per_call=len(batch_patches) // 2,
+                )
+            else:
+                raise
+
+        # Distribute detections to writer by tile
         det_by_tile: dict[str, list] = defaultdict(list)
         for det in detections:
             det_by_tile[det.tile_id].append(det)
@@ -313,6 +371,12 @@ def run_pipeline(
         for tile_id, patches in batch:
             del patches
             write_queue.put((tile_id, det_by_tile.get(tile_id, [])))
+
+        # Swap: next becomes current
+        batch, batch_patches = next_batch, next_patches
+        tensor, meta = next_tensor, next_meta
+
+    infer_executor.shutdown(wait=False)
 
     # --- 8. Shutdown ---
     write_queue.put(None)
