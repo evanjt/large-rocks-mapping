@@ -144,15 +144,6 @@ def crop_patches(
     return patches
 
 
-def fuse_rgb_hillshade(
-    rgb: np.ndarray, hillshade: np.ndarray, channel: int = 1,
-) -> np.ndarray:
-    """Replace one RGB channel with hillshade. Arrays are (bands, H, W)."""
-    fused = rgb.copy()
-    fused[channel] = hillshade.astype(rgb.dtype)
-    return fused
-
-
 def yolo_to_map_coords(
     cx: float, cy: float, w: float, h: float,
     img_size: int, transform: rasterio.Affine,
