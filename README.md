@@ -28,7 +28,7 @@ Your inputs must follow the exact same preprocessing steps used during training.
 All data (RGB and DSM) was originally sourced from swisstopo.
 
 - RGB imagery downsampled to 50 cm resolution (to match DSM's resolution)
-- Hillshade is produced from the DSM using QGIS’s hillshade function (azimuth 0°, vertical angle 0°) 
+- Hillshade is computed as overhead illumination: `shade = 255 / sqrt(1 + dzdx² + dzdy²)` via Horn’s gradient method. Equivalent to `255 * cos(slope)`. The original training data was generated in QGIS with azimuth=0, vertical_angle=0, which produces this same overhead/slope-magnitude effect (not directional). Validated against 992 training patches across 62 tiles: r=0.999, MAE=0.586, 99.4%+ pixels within 1.0.
 - Hillshade and RGB patches must share exact filenames
 - RGB patches are fused with hillshade by replacing the green channel (this fusion method showed best results)
 
@@ -129,7 +129,7 @@ rock-detect export --input detections.duckdb --output detections.geojson
 
 The nationwide pipeline reproduces the exact preprocessing used during training:
 
-- **Hillshade**: `255 × cos(slope)` via Horn's method — verified against 16 training patches of tile 2581-1126 (r=0.999, MAE=0.029, 99.87% of pixels within 1.0)
+- **Hillshade**: `255 / sqrt(1 + dzdx² + dzdy²)` via Horn's method (= `255 * cos(slope)`) — validated against all 992 training patches across 62 tiles (r=0.999, MAE=0.586, 99.4%+ pixels within 1.0). 5 representative patches are regression-tested in `tests/test_hillshade.py`.
 - **DSM source**: Raw Swisstopo swissSURFACE3D (0.5m) — verified bit-exact to training data (`np.array_equal() = True`)
 - **RGB-hillshade fusion**: Green channel replacement (index 1) — identical to training
 - **Model weights**: `active_teacher.pt` — md5 identical to Alexis's original
