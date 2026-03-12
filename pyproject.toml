@@ -28,3 +28,6 @@ packages = ["nationwide"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
