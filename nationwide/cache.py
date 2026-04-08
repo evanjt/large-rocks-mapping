@@ -67,7 +67,9 @@ def init_cache(cache_dir: Path, max_gb: float) -> None:
     max_bytes = int(max_gb * 1_000_000_000)
     _tile_cache = TileCache(cache_dir, max_bytes)
     _cache_config = (str(cache_dir), max_bytes)
-    log.info("Tile cache: %s (max %.1f GB)", cache_dir, max_gb)
+    current_bytes = sum(f.stat().st_size for f in cache_dir.iterdir() if f.is_file())
+    pct = current_bytes / max_bytes * 100 if max_bytes > 0 else 0
+    log.info("Tile cache: %s (%.1f / %.1f GB, %.0f%%)", cache_dir, current_bytes / 1e9, max_gb, pct)
 
 
 def get_cache_config() -> tuple[str, int] | None:

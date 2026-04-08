@@ -23,9 +23,10 @@ from utils.constants import (
 
 log = logging.getLogger(__name__)
 
+_POOL_SIZE = os.cpu_count() or 8
 _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
-_SESSION.mount("https://", HTTPAdapter(pool_maxsize=4, pool_connections=4))
+_SESSION.mount("https://", HTTPAdapter(pool_maxsize=_POOL_SIZE, pool_connections=_POOL_SIZE))
 
 _hs_mode: str = "overhead"
 _hs_azimuth: float = 315.0
@@ -56,7 +57,7 @@ def reinit_session(
     global _SESSION, _hs_mode, _hs_azimuth, _hs_altitude
     _SESSION = requests.Session()
     _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
-    _SESSION.mount("https://", HTTPAdapter(pool_maxsize=4, pool_connections=4))
+    _SESSION.mount("https://", HTTPAdapter(pool_maxsize=_POOL_SIZE, pool_connections=_POOL_SIZE))
     _hs_mode = hs_mode
     _hs_azimuth = hs_azimuth
     _hs_altitude = hs_altitude

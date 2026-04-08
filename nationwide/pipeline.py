@@ -200,7 +200,7 @@ def run_pipeline(
     model_path: Path,
     output_db: Path,
     tile_source: list[tuple[str, str, str]],
-    device: str = "cuda:0",
+    device: str = "auto",
     download_threads: int = 8,
     conf: float = 0.10,
     iou: float = 0.40,
@@ -282,12 +282,10 @@ def run_pipeline(
     )
     producer.start()
 
-    # --- 4. Load YOLO model ---
+    # --- 4. Load YOLO model (already validated in CLI entry point) ---
     log.info(f"Loading model from {model_path} on {device} ...")
     import torch
     from ultralytics import YOLO
-    if not device:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model = YOLO(model_path)
     if device != "cpu":
         model.to(device)
@@ -453,7 +451,7 @@ def run(
     bbox: Optional[str] = typer.Option(None, help="WGS84 bounding box: west,south,east,north"),
     all_switzerland: bool = typer.Option(False, "--all", help="Process all of Switzerland"),
     min_elevation: float = typer.Option(1500, help="Skip tiles below this elevation in meters (0=disabled)"),
-    device: str = typer.Option("cuda:0", help="PyTorch device"),
+    device: str = typer.Option("auto", help="PyTorch device (auto, cuda:0, cpu, etc.)"),
     download_threads: int = typer.Option(8, help="Download thread count"),
     max_tiles: int = typer.Option(0, help="Limit tiles (0=all)"),
     conf: float = typer.Option(0.10, help="Confidence threshold"),
@@ -498,6 +496,22 @@ def run(
     if not model.exists():
         log.error(f"Model not found: {model}. Place a .pt file in models/.")
         raise typer.Exit(code=1)
+
+    # Fail fast: verify GPU and model load before slow network/elevation work
+    import torch
+    from ultralytics import YOLO
+    if device == "auto":
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    log.info(f"Device: {device}")
+    if device != "cpu" and not torch.cuda.is_available():
+        log.error(f"Device {device} requested but no GPU available. Pass --device cpu or install the correct PyTorch build (cuda/rocm).")
+        raise typer.Exit(code=1)
+    test_model = YOLO(model)
+    if device != "cpu":
+        test_model.to(device)
+    del test_model
+    torch.cuda.empty_cache() if device != "cpu" else None
+    log.info("Model and GPU check passed")
 
     run_pipeline(
         model_path=model,

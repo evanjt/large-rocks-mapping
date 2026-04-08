@@ -107,25 +107,30 @@ Applies the trained model to Swisstopo tiles at national scale. Requires Python 
 
 ## Install
 
-    uv sync
+    # NVIDIA GPU
+    uv sync --extra cuda
 
-    # AMD GPU (ROCm):
-    uv pip install torch torchvision pytorch-triton-rocm \
-        --index-url https://download.pytorch.org/whl/rocm6.3
+    # AMD GPU (ROCm)
+    uv sync --extra rocm
 
 ## Run
 
+The `--extra` must match the install step on every `uv run` call (`cuda` or `rocm`).
+
     # Specific tiles
-    uv run large-rocks-mapping --model models/active_teacher.pt --coords 2587-1133
+    uv run --extra cuda large-rocks-mapping \
+        --model models/active_teacher.pt --coords 2587-1133
 
     # Bounding box (WGS84: west,south,east,north)
-    uv run large-rocks-mapping --model models/active_teacher.pt --bbox "7.0,46.5,8.0,47.0"
+    uv run --extra cuda large-rocks-mapping \
+        --model models/active_teacher.pt --bbox "7.0,46.5,8.0,47.0"
 
     # All of Switzerland
-    uv run large-rocks-mapping --model models/active_teacher.pt --all
+    uv run --extra cuda large-rocks-mapping \
+        --model models/active_teacher.pt --all
 
     # Full option reference
-    uv run large-rocks-mapping --help
+    uv run --extra cuda large-rocks-mapping --help
 
 | Option | Default | Description |
 |---|---|---|
@@ -135,7 +140,7 @@ Applies the trained model to Swisstopo tiles at national scale. Requires Python 
 | `--bbox` | | WGS84 bounding box (`west,south,east,north`) |
 | `--all` | `false` | Process all of Switzerland |
 | `--min-elevation` | `1500` | Skip tiles below this elevation in meters, 0 to disable |
-| `--device` | `cuda:0` | PyTorch device |
+| `--device` | `auto` | PyTorch device (auto, cuda:0, cpu, etc.) |
 | `--download-threads` | `8` | Parallel download workers |
 | `--conf` | `0.10` | Confidence threshold |
 | `--iou` | `0.40` | IoU threshold |
