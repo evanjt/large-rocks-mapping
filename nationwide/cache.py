@@ -32,8 +32,9 @@ class TileCache:
         return path.read_bytes()
 
     def put(self, url: str, data: bytes) -> None:
-        path = self._dir / self._key(url)
-        path.write_bytes(data)
+        with self._lock:
+            path = self._dir / self._key(url)
+            path.write_bytes(data)
         self._evict_if_needed()
 
     def _evict_if_needed(self) -> None:

@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-rock-detect = "nationwide:app"
+large-rocks-mapping = "nationwide:app"
 
 [build-system]
 requires = ["hatchling"]

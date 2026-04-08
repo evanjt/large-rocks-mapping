@@ -1,7 +1,12 @@
 import logging
+import os
+import shutil
+import subprocess
+import tempfile
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import cv2
 import numpy as np
 import rasterio
@@ -12,7 +17,7 @@ from nationwide.cache import cache_get, cache_put, reinit_cache
 from nationwide.db import Detection
 from rasterio.enums import Resampling
 from utils.constants import (
-    DSM_RES, FUSION_CHANNEL, SRC_CROP_DSM,
+    FUSION_CHANNEL, SRC_CROP_DSM,
     SRC_STRIDE_DSM, SWISSIMAGE_RES, TARGET_RES, TILE_SIZE_PX,
 )
 
@@ -22,17 +27,39 @@ _SESSION = requests.Session()
 _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
 _SESSION.mount("https://", HTTPAdapter(pool_maxsize=4, pool_connections=4))
 
+_hs_mode: str = "overhead"
+_hs_azimuth: float = 315.0
+_hs_altitude: float = 45.0
 
-def reinit_session(cache_dir: str | None = None, cache_max_bytes: int = 0) -> None:
-    """Reinitialize HTTP session and tile cache in worker processes.
+
+def set_hillshade_config(mode: str, az: float, alt: float) -> None:
+    """Set hillshade mode and parameters. Fails early if gdaldem is missing."""
+    global _hs_mode, _hs_azimuth, _hs_altitude
+    if shutil.which("gdaldem") is None:
+        raise RuntimeError("gdaldem not found on PATH — install GDAL CLI tools")
+    if mode not in ("overhead", "combined", "directional"):
+        raise ValueError(f"Unknown hillshade mode: {mode!r}")
+    _hs_mode = mode
+    _hs_azimuth = az
+    _hs_altitude = alt
+
+
+def reinit_session(
+    cache_dir: str | None = None, cache_max_bytes: int = 0,
+    hs_mode: str = "overhead", hs_azimuth: float = 315.0, hs_altitude: float = 45.0,
+) -> None:
+    """Reinitialize HTTP session, tile cache, and hillshade config in worker processes.
 
     ProcessPoolExecutor workers get a fresh module import —
-    must re-create session and cache in each worker.
+    must re-create session, cache, and hillshade config in each worker.
     """
-    global _SESSION
+    global _SESSION, _hs_mode, _hs_azimuth, _hs_altitude
     _SESSION = requests.Session()
     _SESSION.headers.update({"User-Agent": "rock-detection-pipeline/0.1"})
     _SESSION.mount("https://", HTTPAdapter(pool_maxsize=4, pool_connections=4))
+    _hs_mode = hs_mode
+    _hs_azimuth = hs_azimuth
+    _hs_altitude = hs_altitude
     reinit_cache(cache_dir, cache_max_bytes)
 
 
@@ -57,34 +84,37 @@ def download_to_memory(url: str, retries: int = 3, timeout: int = 120) -> bytes:
     raise RuntimeError("Unreachable")
 
 
-def generate_hillshade(
-    dsm: np.ndarray,
-    res: float = 0.5,
-    z_factor: float = 1.0,
-) -> np.ndarray:
-    """Overhead hillshade from slope magnitude: shade = 255 * cos(slope).
+def generate_hillshade(dsm_path: str | Path) -> np.ndarray:
+    """Generate hillshade via gdaldem subprocess.
 
-    Validated against 16 training patches of tile 2581-1126:
-    r=0.999+, MAE=0.029, 99.87% of pixels within 1.0 of training values.
+    Uses module-level config (_hs_mode, _hs_azimuth, _hs_altitude) set by
+    set_hillshade_config() or reinit_session().
+
+    Modes:
+      overhead    → gdaldem hillshade -alt 90 (matches QGIS training data)
+      combined    → gdaldem hillshade -combined -az X -alt Y -compute_edges
+      directional → gdaldem hillshade -az X -alt Y -compute_edges
     """
-    dsm = dsm.astype(np.float32) * z_factor
+    fd, out_path = tempfile.mkstemp(suffix=".tif")
+    os.close(fd)
+    try:
+        cmd = [
+            "gdaldem", "hillshade", str(dsm_path), out_path,
+            "-compute_edges", "-of", "GTiff", "-q",
+        ]
+        if _hs_mode == "overhead":
+            cmd.extend(["-alt", "90", "-az", "0"])
+        elif _hs_mode == "combined":
+            cmd.extend(["-combined", "-az", str(_hs_azimuth), "-alt", str(_hs_altitude)])
+        else:  # directional
+            cmd.extend(["-az", str(_hs_azimuth), "-alt", str(_hs_altitude)])
 
-    padded = np.pad(dsm, 1, mode="edge")
+        subprocess.run(cmd, capture_output=True, check=True)
 
-    dzdx = (
-        (padded[:-2, 2:] + 2 * padded[1:-1, 2:] + padded[2:, 2:])
-        - (padded[:-2, :-2] + 2 * padded[1:-1, :-2] + padded[2:, :-2])
-    ) / (8.0 * res)
-
-    dzdy = (
-        (padded[:-2, :-2] + 2 * padded[:-2, 1:-1] + padded[:-2, 2:])
-        - (padded[2:, :-2] + 2 * padded[2:, 1:-1] + padded[2:, 2:])
-    ) / (8.0 * res)
-
-    shade = 1.0 / np.sqrt(1.0 + dzdx**2 + dzdy**2)
-
-    shade = np.clip(shade * 255.0, 0, 255).astype(np.uint8)
-    return shade
+        with rasterio.open(out_path) as src:
+            return src.read(1)
+    finally:
+        Path(out_path).unlink(missing_ok=True)
 
 
 def crop_patches(
@@ -157,6 +187,33 @@ def yolo_to_map_coords(
     return easting, northing, width_m, height_m
 
 
+def _extract_detections(
+    results, meta: list[tuple[rasterio.Affine, int, int, str]],
+) -> list[Detection]:
+    """Extract Detection objects from YOLO results with coordinate transform."""
+    detections = []
+    for result, (transform, row, col, tile_id) in zip(results, meta):
+        boxes = result.boxes
+        if boxes is None or len(boxes) == 0:
+            continue
+        patch_id = f"{tile_id}_{row}_{col}"
+        for i in range(len(boxes)):
+            xywhn = boxes.xywhn[i].cpu().numpy()
+            cx, cy, w, h = xywhn
+            conf_val = float(boxes.conf[i].cpu())
+            cls = int(boxes.cls[i].cpu())
+            easting, northing, w_m, h_m = yolo_to_map_coords(
+                cx, cy, w, h, TILE_SIZE_PX, transform,
+            )
+            detections.append(Detection(
+                tile_id=tile_id, patch_id=patch_id,
+                easting=float(easting), northing=float(northing),
+                confidence=conf_val, bbox_w_m=float(w_m), bbox_h_m=float(h_m),
+                class_id=cls,
+            ))
+    return detections
+
+
 def dedup_detections(
     detections: list[Detection], distance_m: float = 7.5,
 ) -> list[Detection]:
@@ -212,7 +269,6 @@ def process_tile(
     coord: str,
     rgb_url: str,
     dsm_url: str,
-    min_elevation: float = 0,
 ) -> list[tuple[np.ndarray, rasterio.Affine, int, int, str]]:
     """Download, hillshade, crop, and fuse one tile entirely in memory.
 
@@ -225,22 +281,20 @@ def process_tile(
         rgb_bytes = rgb_future.result()
         dsm_bytes = dsm_future.result()
 
-    with rasterio.io.MemoryFile(dsm_bytes) as memfile:
-        with memfile.open() as src:
-            dsm_data = src.read(1)
+    # Write DSM bytes to temp file (gdaldem needs a file)
+    fd, dsm_path = tempfile.mkstemp(suffix=".tif")
+    os.close(fd)
+    with open(dsm_path, "wb") as f:
+        f.write(dsm_bytes)
+    del dsm_bytes
+    try:
+        with rasterio.open(dsm_path) as src:
             dsm_transform = src.transform
             dsm_bounds = src.bounds
-    del dsm_bytes
 
-    if min_elevation > 0:
-        max_elev = float(dsm_data.max())
-        if max_elev < min_elevation:
-            log.debug(f"Tile {coord} below {min_elevation}m (max={max_elev:.0f}m), skipping")
-            del dsm_data, rgb_bytes
-            return []
-
-    hillshade = generate_hillshade(dsm_data, res=DSM_RES)
-    del dsm_data
+        hillshade = generate_hillshade(dsm_path)
+    finally:
+        Path(dsm_path).unlink(missing_ok=True)
 
     # DSM already at target res — no resampling needed
     hs_patches = crop_patches(
@@ -323,27 +377,7 @@ def infer_on_tensor(
         source=batch, conf=conf, iou=iou, imgsz=TILE_SIZE_PX,
         save=False, verbose=False,
     )
-    detections = []
-    for result, (transform, row, col, tile_id) in zip(results, meta):
-        boxes = result.boxes
-        if boxes is None or len(boxes) == 0:
-            continue
-        patch_id = f"{tile_id}_{row}_{col}"
-        for i in range(len(boxes)):
-            xywhn = boxes.xywhn[i].cpu().numpy()
-            cx, cy, w, h = xywhn
-            conf_val = float(boxes.conf[i].cpu())
-            cls = int(boxes.cls[i].cpu())
-            easting, northing, w_m, h_m = yolo_to_map_coords(
-                cx, cy, w, h, TILE_SIZE_PX, transform,
-            )
-            detections.append(Detection(
-                tile_id=tile_id, patch_id=patch_id,
-                easting=float(easting), northing=float(northing),
-                confidence=conf_val, bbox_w_m=float(w_m), bbox_h_m=float(h_m),
-                class_id=cls,
-            ))
-    return detections
+    return _extract_detections(results, meta)
 
 
 def run_inference(
@@ -403,26 +437,10 @@ def run_inference(
         all_results.extend(zip(results, meta[start:end]))
         del batch
 
-    detections = []
-    for result, (transform, row, col, tile_id) in all_results:
-        boxes = result.boxes
-        if boxes is None or len(boxes) == 0:
-            continue
-        patch_id = f"{tile_id}_{row}_{col}"
-        for i in range(len(boxes)):
-            xywhn = boxes.xywhn[i].cpu().numpy()
-            cx, cy, w, h = xywhn
-            conf_val = float(boxes.conf[i].cpu())
-            cls = int(boxes.cls[i].cpu())
-            easting, northing, w_m, h_m = yolo_to_map_coords(
-                cx, cy, w, h, TILE_SIZE_PX, transform,
-            )
-            detections.append(Detection(
-                tile_id=tile_id, patch_id=patch_id,
-                easting=float(easting), northing=float(northing),
-                confidence=conf_val, bbox_w_m=float(w_m), bbox_h_m=float(h_m),
-                class_id=cls,
-            ))
+    detections = _extract_detections(
+        [r for r, _ in all_results],
+        [m for _, m in all_results],
+    )
 
     if oom_fallback_detections is not None:
         detections.extend(oom_fallback_detections)

@@ -27,6 +27,7 @@ from nationwide.processing import (
     process_tile,
     reinit_session,
     run_inference,
+    set_hillshade_config,
 )
 from nationwide.spatial import query_stac_bbox, resolve_batch
 
@@ -52,6 +53,9 @@ def _producer_thread(
     tiles: list[tuple[str, str, str]],
     tile_queue: queue.Queue,
     download_threads: int,
+    hs_mode: str = "overhead",
+    hs_azimuth: float = 315.0,
+    hs_altitude: float = 45.0,
 ) -> None:
     """Download+preprocess tiles in parallel processes, put results in queue.
 
@@ -59,7 +63,8 @@ def _producer_thread(
     contention during rasterio TIFF decompression and numpy processing.
     """
     cc = get_cache_config()
-    init_args = (cc[0], cc[1]) if cc else (None, 0)
+    base = (cc[0], cc[1]) if cc else (None, 0)
+    init_args = (*base, hs_mode, hs_azimuth, hs_altitude)
 
     with ProcessPoolExecutor(
         max_workers=download_threads,
@@ -203,6 +208,9 @@ def run_pipeline(
     max_batch_tiles: int = 8,
     queue_maxsize: int = 0,
     batch_timeout: float = 0.5,
+    hs_mode: str = "overhead",
+    hs_azimuth: float = 315.0,
+    hs_altitude: float = 45.0,
 ) -> None:
     """Main pipeline: download+preprocess -> infer -> dedup -> store.
 
@@ -269,7 +277,7 @@ def run_pipeline(
 
     producer = threading.Thread(
         target=_producer_thread,
-        args=(remaining, tile_queue, download_threads),
+        args=(remaining, tile_queue, download_threads, hs_mode, hs_azimuth, hs_altitude),
         daemon=True,
     )
     producer.start()
@@ -296,6 +304,9 @@ def run_pipeline(
         torch.cuda.empty_cache()
 
     # --- 6. Start background DB writer ---
+    # Accessed from main + writer threads. Individual key updates are practically
+    # safe under CPython's GIL (each thread writes different keys in the normal
+    # path). Counters may lose an increment under concurrent failure events.
     stats = {"total_detections": 0, "tiles_processed": 0, "tiles_failed": 0}
     pbar = tqdm(total=len(remaining), desc="Processing tiles", unit="tile")
     write_queue: queue.Queue = queue.Queue()
@@ -368,15 +379,14 @@ def run_pipeline(
         for det in detections:
             det_by_tile[det.tile_id].append(det)
 
-        for tile_id, patches in batch:
-            del patches
+        for tile_id, _patches in batch:
             write_queue.put((tile_id, det_by_tile.get(tile_id, [])))
 
         # Swap: next becomes current
         batch, batch_patches = next_batch, next_patches
         tensor, meta = next_tensor, next_meta
 
-    infer_executor.shutdown(wait=False)
+    infer_executor.shutdown(wait=True)
 
     # --- 8. Shutdown ---
     write_queue.put(None)
@@ -431,12 +441,13 @@ def run_pipeline(
     log.info("=" * 60)
 
 
-app = typer.Typer(help="Nationwide rock detection pipeline.")
+app = typer.Typer(help="Large-scale rock detection on Swisstopo imagery.")
 
 
 @app.command()
 def run(
-    model: Path = typer.Option(..., help="Path to YOLO .pt model"),
+    ctx: typer.Context,
+    model: Optional[Path] = typer.Option(None, help="Path to YOLO .pt model"),
     output: Path = typer.Option(Path("detections.duckdb"), help="DuckDB output path"),
     coords: Optional[list[str]] = typer.Option(None, help="Tile coordinates (e.g. 2587-1133)"),
     bbox: Optional[str] = typer.Option(None, help="WGS84 bounding box: west,south,east,north"),
@@ -452,8 +463,15 @@ def run(
     max_batch_tiles: int = typer.Option(8, help="Max tiles per GPU batch"),
     queue_size: int = typer.Option(0, help="Producer-consumer queue size (0=auto: download_threads*3)"),
     batch_timeout: float = typer.Option(0.5, help="Seconds to wait for more tiles before running inference (0=no wait)"),
+    hillshade: str = typer.Option("overhead", help="Hillshade mode: overhead, combined, or directional"),
+    hillshade_az: float = typer.Option(315.0, help="Sun azimuth in degrees (combined/directional only)"),
+    hillshade_alt: float = typer.Option(45.0, help="Sun altitude in degrees (combined/directional only)"),
 ) -> None:
-    """Run the nationwide rock detection pipeline."""
+    """Run the rock detection pipeline on Swisstopo tiles."""
+    if model is None:
+        print(ctx.get_help())
+        raise typer.Exit()
+    set_hillshade_config(hillshade, hillshade_az, hillshade_alt)
     init_cache(cache_dir, cache_gb)
     set_stac_cache_dir(cache_dir)
 
@@ -493,4 +511,7 @@ def run(
         max_batch_tiles=max_batch_tiles,
         queue_maxsize=queue_size,
         batch_timeout=batch_timeout,
+        hs_mode=hillshade,
+        hs_azimuth=hillshade_az,
+        hs_altitude=hillshade_alt,
     )

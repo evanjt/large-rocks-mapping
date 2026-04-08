@@ -103,34 +103,47 @@ Thanks for your interest in this project!
 
 # Nationwide Detection Pipeline
 
-The `nationwide/` directory contains a streaming pipeline that applies the trained model to Swisstopo tiles at national scale.
+Applies the trained model to Swisstopo tiles at national scale. Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), GDAL CLI tools (`gdaldem`), and network access to data.geo.admin.ch.
 
-```bash
-# Install (requires uv, Python >=3.11, GDAL CLI tools)
-uv sync
+## Install
 
-# AMD GPU — replace CUDA torch with ROCm build:
-uv pip install torch torchvision pytorch-triton-rocm \
-    --index-url https://download.pytorch.org/whl/rocm6.3
+    uv sync
 
-# Run on specific tiles
-rock-detect run --model models/active_teacher.pt --coords 2587-1133
+    # AMD GPU (ROCm):
+    uv pip install torch torchvision pytorch-triton-rocm \
+        --index-url https://download.pytorch.org/whl/rocm6.3
 
-# Export to GeoJSON
-rock-detect export --input detections.duckdb --output detections.geojson
-```
+## Run
 
-# Code Structure
+    # Specific tiles
+    uv run large-rocks-mapping --model models/active_teacher.pt --coords 2587-1133
 
-- `src/`, `utils/` — Original research code (training, dataset, inference). Unchanged from the original.
-- `nationwide/` — Deployment pipeline applying the trained model to Swisstopo tiles at national scale.
+    # Bounding box (WGS84: west,south,east,north)
+    uv run large-rocks-mapping --model models/active_teacher.pt --bbox "7.0,46.5,8.0,47.0"
 
-# Preprocessing Verification
+    # All of Switzerland
+    uv run large-rocks-mapping --model models/active_teacher.pt --all
 
-The nationwide pipeline reproduces the exact preprocessing used during training:
+    # Full option reference
+    uv run large-rocks-mapping --help
 
-- **Hillshade**: `255 / sqrt(1 + dzdx² + dzdy²)` via Horn's method (= `255 * cos(slope)`) — validated against all 992 training patches across 62 tiles (r=0.999, MAE=0.586, 99.4%+ pixels within 1.0). 5 representative patches are regression-tested in `tests/test_hillshade.py`.
-- **DSM source**: Raw Swisstopo swissSURFACE3D (0.5m) — verified bit-exact to training data (`np.array_equal() = True`)
-- **RGB-hillshade fusion**: Green channel replacement (index 1) — identical to training
-- **Model weights**: `active_teacher.pt` — md5 identical to Alexis's original
-- **Inference params**: conf=0.10, iou=0.40, imgsz=640 — same as training/validation
+| Option | Default | Description |
+|---|---|---|
+| `--model` | | YOLO `.pt` weights path |
+| `--output` | `detections.duckdb` | DuckDB output path |
+| `--coords` | | Tile coordinate(s), repeatable (e.g. `2587-1133`) |
+| `--bbox` | | WGS84 bounding box (`west,south,east,north`) |
+| `--all` | `false` | Process all of Switzerland |
+| `--min-elevation` | `1500` | Skip tiles below this elevation in meters, 0 to disable |
+| `--device` | `cuda:0` | PyTorch device |
+| `--download-threads` | `8` | Parallel download workers |
+| `--conf` | `0.10` | Confidence threshold |
+| `--iou` | `0.40` | IoU threshold |
+| `--hillshade` | `overhead` | Hillshade mode: `overhead`, `combined`, or `directional` |
+| `--hillshade-az` | `315.0` | Sun azimuth in degrees (combined/directional only) |
+| `--hillshade-alt` | `45.0` | Sun altitude in degrees (combined/directional only) |
+| `--cache-dir` | `data/tile_cache` | Tile cache directory |
+| `--cache-gb` | `10` | Max tile cache in GB, 0 to disable |
+| `--max-batch-tiles` | `8` | Tiles per GPU batch |
+
+Writes detections to DuckDB and auto-exports a GeoPackage (`.gpkg`). Processed tiles are checkpointed — re-running the same output file skips completed tiles. Downloaded tiles and STAC query results are cached on disk in `--cache-dir`.
