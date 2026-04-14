@@ -453,11 +453,13 @@ def run(
     conf: float = typer.Option(0.10, help="Confidence threshold"),
     iou: float = typer.Option(0.40, help="IoU threshold"),
     cache_dir: Path = typer.Option(Path("data/tile_cache"), help="Tile cache directory"),
-    cache_gb: float = typer.Option(10.0, help="Max tile cache size in GB (0 to disable)"),
+    cache_gb: float = typer.Option(500.0, help="Max tile cache size in GB (0 to disable)"),
     max_batch_tiles: int = typer.Option(8, help="Max tiles per GPU batch"),
     queue_size: int = typer.Option(0, help="Producer-consumer queue size (0=auto: download_threads*3)"),
     batch_timeout: float = typer.Option(0.5, help="Seconds to wait for more tiles before running inference (0=no wait)"),
     no_dedup: bool = typer.Option(False, "--no-dedup", help="Disable spatial deduplication"),
+    rgb_year: int = typer.Option(0, "--rgb-year", help="SwissIMAGE year (0=newest)"),
+    dsm_year: int = typer.Option(0, "--dsm-year", help="swissALTI3D year (0=newest)"),
 ) -> None:
     """Run the rock detection pipeline on Swisstopo tiles."""
     if model is None:
@@ -470,7 +472,7 @@ def run(
     if all_switzerland:
         bbox = SWITZERLAND_BBOX
     if bbox:
-        tile_list = query_stac_bbox(bbox)
+        tile_list = query_stac_bbox(bbox, rgb_year=rgb_year, dsm_year=dsm_year)
     elif coords:
         log.info("Resolving tile URLs ...")
         url_map = resolve_batch(list(coords), threads=download_threads)

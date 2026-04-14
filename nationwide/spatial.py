@@ -33,7 +33,7 @@ def _find_latest_url(
 def resolve_tile_urls(
     coord: str, max_year: int = 2026,
 ) -> tuple[str, str] | None:
-    """Find latest SwissIMAGE RGB and swissALTI3D DSM URLs for a tile.
+    """Find latest SwissIMAGE RGB and swissSURFACE3D DSM URLs for a tile.
 
     Returns (rgb_url, dsm_url) or None if either is missing.
     """
@@ -89,57 +89,73 @@ def _stac_paginate(
                 break
 
 
-def _extract_stac_tiles(items: Iterator[dict]) -> dict[str, str]:
+def _extract_stac_tiles(
+    items: Iterator[dict], target_year: int = 0,
+) -> dict[str, str]:
     """Extract (coord -> asset_url) mapping from STAC items.
 
-    Parses item IDs for XXXX-YYYY coordinates and picks the first .tif
-    asset URL per coordinate (STAC typically returns newest first).
+    Parses item IDs for XXXX-YYYY coordinates. If target_year is set,
+    only keeps items from that year. Otherwise keeps the newest per coord.
     """
     result: dict[str, str] = {}
+    result_year: dict[str, int] = {}
+    year_re = __import__("re").compile(r"_(\d{4})_")
     for item in items:
         item_id = item.get("id", "")
         m = COORD_RE.search(item_id)
         if not m:
             continue
         coord = m.group(1)
-        if coord in result:
-            continue  # Keep first (typically newest)
+        ym = year_re.search(item_id)
+        year = int(ym.group(1)) if ym else 0
+        if target_year and year != target_year:
+            continue
+        if coord in result and year <= result_year.get(coord, 0):
+            continue  # Already have a newer or equal version
         for asset in item.get("assets", {}).values():
             href = asset.get("href", "")
             if href.endswith(".tif"):
                 result[coord] = href
+                result_year[coord] = year
                 break
     return result
 
 
-def query_stac_bbox(bbox: str) -> list[tuple[str, str, str]]:
+def query_stac_bbox(
+    bbox: str, rgb_year: int = 0, dsm_year: int = 0,
+) -> list[tuple[str, str, str]]:
     """Query STAC API for tile pairs in a WGS84 bounding box.
-
-    Uses a local DuckDB cache (in the tile cache dir) to avoid re-querying
-    the STAC API on subsequent runs with the same bbox.
 
     Args:
         bbox: "west,south,east,north" (e.g. "7.0,46.5,8.0,47.0").
+        rgb_year: If > 0, only use SwissIMAGE tiles from this year.
+        dsm_year: If > 0, only use swissSURFACE3D tiles from this year.
 
     Returns:
         List of (coord, rgb_url, dsm_url) tuples.
     """
-    cached = load_stac_cache(bbox)
-    if cached is not None:
-        log.info(f"STAC cache hit: {len(cached)} tile pairs for bbox={bbox}")
-        return cached
+    cache_key = bbox if not rgb_year and not dsm_year else None
+    if cache_key:
+        cached = load_stac_cache(cache_key)
+        if cached is not None:
+            log.info(f"STAC cache hit: {len(cached)} tile pairs for bbox={bbox}")
+            return cached
 
-    log.info(f"Querying STAC for SwissIMAGE tiles in bbox={bbox} ...")
-    rgb_tiles = _extract_stac_tiles(_stac_paginate(SI_COLLECTION, bbox))
+    rgb_label = f" (year={rgb_year})" if rgb_year else ""
+    dsm_label = f" (year={dsm_year})" if dsm_year else ""
+
+    log.info(f"Querying STAC for SwissIMAGE{rgb_label} tiles in bbox={bbox} ...")
+    rgb_tiles = _extract_stac_tiles(_stac_paginate(SI_COLLECTION, bbox), rgb_year)
     log.info(f"  Found {len(rgb_tiles)} SwissIMAGE tiles")
 
-    log.info(f"Querying STAC for swissALTI3D tiles in bbox={bbox} ...")
-    dsm_tiles = _extract_stac_tiles(_stac_paginate(DSM_COLLECTION, bbox))
-    log.info(f"  Found {len(dsm_tiles)} swissALTI3D tiles")
+    log.info(f"Querying STAC for swissSURFACE3D{dsm_label} tiles in bbox={bbox} ...")
+    dsm_tiles = _extract_stac_tiles(_stac_paginate(DSM_COLLECTION, bbox), dsm_year)
+    log.info(f"  Found {len(dsm_tiles)} swissSURFACE3D tiles")
 
     common = sorted(set(rgb_tiles) & set(dsm_tiles))
     log.info(f"  Matched pairs: {len(common)}")
 
     result = [(c, rgb_tiles[c], dsm_tiles[c]) for c in common]
-    save_stac_cache(bbox, result)
+    if cache_key:
+        save_stac_cache(cache_key, result)
     return result
