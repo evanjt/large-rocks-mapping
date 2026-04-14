@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS detections (
     bbox_w_m    FLOAT,
     bbox_h_m    FLOAT,
     class_id    SMALLINT,
+    rgb_source  VARCHAR,
+    dsm_source  VARCHAR,
     inserted_at TIMESTAMP DEFAULT current_timestamp
 );
 """
@@ -39,6 +41,8 @@ class Detection:
     bbox_w_m: float
     bbox_h_m: float
     class_id: int = 0
+    rgb_source: str = ""
+    dsm_source: str = ""
 
 
 def init_db(db_path: str | Path) -> duckdb.DuckDBPyConnection:
@@ -76,13 +80,15 @@ def write_detections(
         return 0
     rows = [
         (d.tile_id, d.patch_id, d.easting, d.northing,
-         d.confidence, d.bbox_w_m, d.bbox_h_m, d.class_id)
+         d.confidence, d.bbox_w_m, d.bbox_h_m, d.class_id,
+         d.rgb_source, d.dsm_source)
         for d in detections
     ]
     con.executemany(
         "INSERT INTO detections "
-        "(tile_id, patch_id, easting, northing, confidence, bbox_w_m, bbox_h_m, class_id) "  # noqa
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(tile_id, patch_id, easting, northing, confidence, bbox_w_m, bbox_h_m, "
+        "class_id, rgb_source, dsm_source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
     return len(rows)

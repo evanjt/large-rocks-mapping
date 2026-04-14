@@ -33,7 +33,7 @@ def _find_latest_url(
 def resolve_tile_urls(
     coord: str, max_year: int = 2026,
 ) -> tuple[str, str] | None:
-    """Find latest SwissIMAGE RGB and swissSURFACE3D DSM URLs for a tile.
+    """Find latest SwissIMAGE RGB and swissALTI3D DSM URLs for a tile.
 
     Returns (rgb_url, dsm_url) or None if either is missing.
     """
@@ -129,7 +129,7 @@ def query_stac_bbox(
     Args:
         bbox: "west,south,east,north" (e.g. "7.0,46.5,8.0,47.0").
         rgb_year: If > 0, only use SwissIMAGE tiles from this year.
-        dsm_year: If > 0, only use swissSURFACE3D tiles from this year.
+        dsm_year: If > 0, only use swissALTI3D tiles from this year.
 
     Returns:
         List of (coord, rgb_url, dsm_url) tuples.
@@ -148,9 +148,9 @@ def query_stac_bbox(
     rgb_tiles = _extract_stac_tiles(_stac_paginate(SI_COLLECTION, bbox), rgb_year)
     log.info(f"  Found {len(rgb_tiles)} SwissIMAGE tiles")
 
-    log.info(f"Querying STAC for swissSURFACE3D{dsm_label} tiles in bbox={bbox} ...")
+    log.info(f"Querying STAC for swissALTI3D{dsm_label} tiles in bbox={bbox} ...")
     dsm_tiles = _extract_stac_tiles(_stac_paginate(DSM_COLLECTION, bbox), dsm_year)
-    log.info(f"  Found {len(dsm_tiles)} swissSURFACE3D tiles")
+    log.info(f"  Found {len(dsm_tiles)} swissALTI3D tiles")
 
     common = sorted(set(rgb_tiles) & set(dsm_tiles))
     log.info(f"  Matched pairs: {len(common)}")

@@ -19,7 +19,7 @@ TARGET_RES = 0.5  # m/pixel
 # SwissIMAGE DOP10 native resolution.
 SWISSIMAGE_RES = 0.1  # m/pixel
 
-# swissSURFACE3D raster native resolution.
+# swissALTI3D raster native resolution.
 DSM_RES = 0.5  # m/pixel
 
 # Green channel replacement — best fusion strategy per baseline experiments.

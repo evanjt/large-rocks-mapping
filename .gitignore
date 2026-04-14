@@ -40,3 +40,4 @@ wandb
 *.gpkg
 
 models/
+validation/

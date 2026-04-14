@@ -401,7 +401,7 @@ def run_pipeline(
     gpkg_path = output_db.with_suffix(".gpkg")
     rows = con.execute(
         "SELECT tile_id, patch_id, easting, northing, confidence, "
-        "bbox_w_m, bbox_h_m, class_id FROM detections",
+        "bbox_w_m, bbox_h_m, class_id, rgb_source, dsm_source FROM detections",
     ).fetchall()
     con.close()
 
@@ -410,7 +410,7 @@ def run_pipeline(
         from shapely.geometry import box
 
         records = []
-        for tile_id, patch_id, e, n, conf_val, w_m, h_m, cls in rows:
+        for tile_id, patch_id, e, n, conf_val, w_m, h_m, cls, rgb_src, dsm_src in rows:
             hw, hh = w_m / 2, h_m / 2
             records.append({
                 "tile_id": tile_id,
@@ -419,6 +419,8 @@ def run_pipeline(
                 "bbox_w_m": round(w_m, 2),
                 "bbox_h_m": round(h_m, 2),
                 "class_id": cls,
+                "rgb_source": rgb_src,
+                "dsm_source": dsm_src,
                 "geometry": box(e - hw, n - hh, e + hw, n + hh),
             })
         gdf = gpd.GeoDataFrame(records, crs="EPSG:2056")
@@ -451,7 +453,7 @@ def run(
     download_threads: int = typer.Option(8, help="Download thread count"),
     max_tiles: int = typer.Option(0, help="Limit tiles (0=all)"),
     conf: float = typer.Option(0.10, help="Confidence threshold"),
-    iou: float = typer.Option(0.40, help="IoU threshold"),
+    iou: float = typer.Option(0.70, help="IoU threshold"),
     cache_dir: Path = typer.Option(Path("data/tile_cache"), help="Tile cache directory"),
     cache_gb: float = typer.Option(500.0, help="Max tile cache size in GB (0 to disable)"),
     max_batch_tiles: int = typer.Option(8, help="Max tiles per GPU batch"),

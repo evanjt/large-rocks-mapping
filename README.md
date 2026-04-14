@@ -119,15 +119,17 @@ The `--extra` must match the install step on every `uv run` call (`cuda` or `roc
 
     # Specific tiles
     uv run --extra cuda large-rocks-mapping \
-        --model models/active_teacher.pt --coords 2587-1133
+        --model models/best.pt --coords 2587-1133
 
     # Bounding box (WGS84: west,south,east,north)
     uv run --extra cuda large-rocks-mapping \
-        --model models/active_teacher.pt --bbox "7.0,46.5,8.0,47.0"
+        --model models/best.pt \
+        --bbox 7.1436,46.2544,7.4738,46.3981 \
+        --no-dedup --iou 0.70 --min-elevation 0
 
     # All of Switzerland
     uv run --extra cuda large-rocks-mapping \
-        --model models/active_teacher.pt --all
+        --model models/best.pt --all
 
     # Full option reference
     uv run --extra cuda large-rocks-mapping --help
@@ -144,11 +146,11 @@ The `--extra` must match the install step on every `uv run` call (`cuda` or `roc
 | `--download-threads` | `8` | Parallel download workers |
 | `--conf` | `0.10` | Confidence threshold |
 | `--iou` | `0.40` | IoU threshold |
-| `--hillshade` | `overhead` | Hillshade mode: `overhead`, `combined`, or `directional` |
-| `--hillshade-az` | `315.0` | Sun azimuth in degrees (combined/directional only) |
-| `--hillshade-alt` | `45.0` | Sun altitude in degrees (combined/directional only) |
+| `--no-dedup` | `false` | Disable 7.5m spatial deduplication |
+| `--rgb-year` | `0` | SwissIMAGE year (0 = newest available) |
+| `--dsm-year` | `0` | swissALTI3D year (0 = newest available) |
 | `--cache-dir` | `data/tile_cache` | Tile cache directory |
-| `--cache-gb` | `10` | Max tile cache in GB, 0 to disable |
+| `--cache-gb` | `500` | Max tile cache in GB, 0 to disable |
 | `--max-batch-tiles` | `8` | Tiles per GPU batch |
 
 Writes detections to DuckDB and auto-exports a GeoPackage (`.gpkg`). Processed tiles are checkpointed — re-running the same output file skips completed tiles. Downloaded tiles and STAC query results are cached on disk in `--cache-dir`.

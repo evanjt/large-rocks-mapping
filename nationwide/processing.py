@@ -71,16 +71,17 @@ def download_to_memory(url: str, retries: int = 3, timeout: int = 120) -> bytes:
 
 
 def generate_hillshade(dsm_path: str | Path) -> np.ndarray:
-    """Generate hillshade via gdaldem -alt 90 (overhead illumination).
+    """Generate hillshade via gdaldem -combined -az 315 -alt 45.
 
-    Matches the QGIS-generated training data (azimuth=0, altitude=90).
+    Combined hillshade blends slope and aspect-based directional lighting.
+    Matches the training data preprocessing for best.pt.
     """
     fd, out_path = tempfile.mkstemp(suffix=".tif")
     os.close(fd)
     try:
         cmd = [
             "gdaldem", "hillshade", str(dsm_path), out_path,
-            "-alt", "90", "-az", "0",
+            "-combined", "-az", "315", "-alt", "45",
             "-compute_edges", "-of", "GTiff", "-q",
         ]
         subprocess.run(cmd, capture_output=True, check=True)
@@ -162,11 +163,11 @@ def yolo_to_map_coords(
 
 
 def _extract_detections(
-    results, meta: list[tuple[rasterio.Affine, int, int, str]],
+    results, meta: list[tuple[rasterio.Affine, int, int, str, str, str]],
 ) -> list[Detection]:
     """Extract Detection objects from YOLO results with coordinate transform."""
     detections = []
-    for result, (transform, row, col, tile_id) in zip(results, meta):
+    for result, (transform, row, col, tile_id, rgb_url, dsm_url) in zip(results, meta):
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
             continue
@@ -183,7 +184,7 @@ def _extract_detections(
                 tile_id=tile_id, patch_id=patch_id,
                 easting=float(easting), northing=float(northing),
                 confidence=conf_val, bbox_w_m=float(w_m), bbox_h_m=float(h_m),
-                class_id=cls,
+                class_id=cls, rgb_source=rgb_url, dsm_source=dsm_url,
             ))
     return detections
 
@@ -243,10 +244,10 @@ def process_tile(
     coord: str,
     rgb_url: str,
     dsm_url: str,
-) -> list[tuple[np.ndarray, rasterio.Affine, int, int, str]]:
+) -> list[tuple[np.ndarray, rasterio.Affine, int, int, str, str, str]]:
     """Download, hillshade, crop, and fuse one tile entirely in memory.
 
-    Returns list of (fused_patch, transform, row, col, tile_id).
+    Returns list of (fused_patch, transform, row, col, tile_id, rgb_url, dsm_url).
     Each fused_patch is (3, 640, 640) uint8.
     """
     with ThreadPoolExecutor(max_workers=2) as dl_pool:
@@ -308,13 +309,13 @@ def process_tile(
         hs_patches, rgb_patches,
     ):
         rgb_patch[FUSION_CHANNEL] = hs_patch
-        results.append((rgb_patch, hs_tf, row, col, tile_id))
+        results.append((rgb_patch, hs_tf, row, col, tile_id, rgb_url, dsm_url))
 
     return results
 
 
 def build_batch_tensor(
-    patches: list[tuple[np.ndarray, rasterio.Affine, int, int, str]],
+    patches: list[tuple[np.ndarray, rasterio.Affine, int, int, str, str, str]],
     device: str = "cuda:0",
 ) -> tuple:
     """Stack patches into a GPU-ready float tensor. Returns (tensor, meta_list).
@@ -327,9 +328,9 @@ def build_batch_tensor(
 
     meta = []
     arrays = []
-    for patch_data, transform, row, col, tile_id in patches:
+    for patch_data, transform, row, col, tile_id, rgb_url, dsm_url in patches:
         arrays.append(patch_data)
-        meta.append((transform, row, col, tile_id))
+        meta.append((transform, row, col, tile_id, rgb_url, dsm_url))
     batch = torch.from_numpy(np.stack(arrays)).float().div_(255.0).to(device)
     return batch, meta
 
@@ -356,7 +357,7 @@ def infer_on_tensor(
 
 def run_inference(
     model,
-    patches: list[tuple[np.ndarray, rasterio.Affine, int, int, str]],
+    patches: list[tuple[np.ndarray, rasterio.Affine, int, int, str, str, str]],
     conf: float = 0.10,
     iou: float = 0.40,
     device: str = "cuda:0",
@@ -374,9 +375,9 @@ def run_inference(
 
     meta = []
     arrays = []
-    for patch_data, transform, row, col, tile_id in patches:
+    for patch_data, transform, row, col, tile_id, rgb_url, dsm_url in patches:
         arrays.append(patch_data)
-        meta.append((transform, row, col, tile_id))
+        meta.append((transform, row, col, tile_id, rgb_url, dsm_url))
 
     chunk_size = len(arrays) if max_patches_per_call <= 0 else max_patches_per_call
 
