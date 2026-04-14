@@ -41,15 +41,15 @@ SI_TEMPLATE = (
 )
 
 DSM_TEMPLATE = (
-    "https://data.geo.admin.ch/ch.swisstopo.swisssurface3d-raster/"
-    "swisssurface3d-raster_{year}_{coord}/"
-    "swisssurface3d-raster_{year}_{coord}_0.5_2056_5728.tif"
+    "https://data.geo.admin.ch/ch.swisstopo.swissalti3d/"
+    "swissalti3d_{year}_{coord}/"
+    "swissalti3d_{year}_{coord}_0.5_2056_5728.tif"
 )
 
 # STAC API
 STAC_BASE = "https://data.geo.admin.ch/api/stac/v0.9"
 SI_COLLECTION = "ch.swisstopo.swissimage-dop10"
-DSM_COLLECTION = "ch.swisstopo.swisssurface3d-raster"
+DSM_COLLECTION = "ch.swisstopo.swissalti3d"
 
 # Tile coordinate pattern (e.g. "2587-1133")
 COORD_RE = re.compile(r"(\d{4}-\d{4})")
