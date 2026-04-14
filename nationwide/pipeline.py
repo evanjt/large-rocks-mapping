@@ -22,12 +22,12 @@ from utils.constants import SWITZERLAND_BBOX, TILE_SIZE_PX
 from nationwide.processing import (
     build_batch_tensor,
     check_elevation,
+    check_gdaldem,
     dedup_detections,
     infer_on_tensor,
     process_tile,
     reinit_session,
     run_inference,
-    set_hillshade_config,
 )
 from nationwide.spatial import query_stac_bbox, resolve_batch
 
@@ -53,9 +53,6 @@ def _producer_thread(
     tiles: list[tuple[str, str, str]],
     tile_queue: queue.Queue,
     download_threads: int,
-    hs_mode: str = "overhead",
-    hs_azimuth: float = 315.0,
-    hs_altitude: float = 45.0,
 ) -> None:
     """Download+preprocess tiles in parallel processes, put results in queue.
 
@@ -64,7 +61,7 @@ def _producer_thread(
     """
     cc = get_cache_config()
     base = (cc[0], cc[1]) if cc else (None, 0)
-    init_args = (*base, hs_mode, hs_azimuth, hs_altitude)
+    init_args = base
 
     with ProcessPoolExecutor(
         max_workers=download_threads,
@@ -103,6 +100,7 @@ def _writer_thread(
     write_queue: queue.Queue,
     stats: dict,
     pbar,
+    no_dedup: bool = False,
 ) -> None:
     """Background thread: dedup + write detections + checkpoint to DuckDB."""
     while True:
@@ -111,7 +109,7 @@ def _writer_thread(
             break
         tile_id, detections = item
         try:
-            tile_dets = dedup_detections(detections, distance_m=7.5)
+            tile_dets = detections if no_dedup else dedup_detections(detections, distance_m=7.5)
             n = write_detections(con, tile_dets)
             mark_tile_done(con, tile_id, n)
             stats["total_detections"] += n
@@ -208,9 +206,7 @@ def run_pipeline(
     max_batch_tiles: int = 8,
     queue_maxsize: int = 0,
     batch_timeout: float = 0.5,
-    hs_mode: str = "overhead",
-    hs_azimuth: float = 315.0,
-    hs_altitude: float = 45.0,
+    no_dedup: bool = False,
 ) -> None:
     """Main pipeline: download+preprocess -> infer -> dedup -> store.
 
@@ -277,7 +273,7 @@ def run_pipeline(
 
     producer = threading.Thread(
         target=_producer_thread,
-        args=(remaining, tile_queue, download_threads, hs_mode, hs_azimuth, hs_altitude),
+        args=(remaining, tile_queue, download_threads),
         daemon=True,
     )
     producer.start()
@@ -311,7 +307,7 @@ def run_pipeline(
 
     writer = threading.Thread(
         target=_writer_thread,
-        args=(con, write_queue, stats, pbar),
+        args=(con, write_queue, stats, pbar, no_dedup),
         daemon=True,
     )
     writer.start()
@@ -461,15 +457,13 @@ def run(
     max_batch_tiles: int = typer.Option(8, help="Max tiles per GPU batch"),
     queue_size: int = typer.Option(0, help="Producer-consumer queue size (0=auto: download_threads*3)"),
     batch_timeout: float = typer.Option(0.5, help="Seconds to wait for more tiles before running inference (0=no wait)"),
-    hillshade: str = typer.Option("overhead", help="Hillshade mode: overhead, combined, or directional"),
-    hillshade_az: float = typer.Option(315.0, help="Sun azimuth in degrees (combined/directional only)"),
-    hillshade_alt: float = typer.Option(45.0, help="Sun altitude in degrees (combined/directional only)"),
+    no_dedup: bool = typer.Option(False, "--no-dedup", help="Disable spatial deduplication"),
 ) -> None:
     """Run the rock detection pipeline on Swisstopo tiles."""
     if model is None:
         print(ctx.get_help())
         raise typer.Exit()
-    set_hillshade_config(hillshade, hillshade_az, hillshade_alt)
+    check_gdaldem()
     init_cache(cache_dir, cache_gb)
     set_stac_cache_dir(cache_dir)
 
@@ -525,7 +519,5 @@ def run(
         max_batch_tiles=max_batch_tiles,
         queue_maxsize=queue_size,
         batch_timeout=batch_timeout,
-        hs_mode=hillshade,
-        hs_azimuth=hillshade_az,
-        hs_altitude=hillshade_alt,
+        no_dedup=no_dedup,
     )

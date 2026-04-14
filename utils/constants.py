@@ -19,7 +19,7 @@ TARGET_RES = 0.5  # m/pixel
 # SwissIMAGE DOP10 native resolution.
 SWISSIMAGE_RES = 0.1  # m/pixel
 
-# swissSURFACE3D raster native resolution.
+# swissALTI3D raster native resolution.
 DSM_RES = 0.5  # m/pixel
 
 # Green channel replacement — best fusion strategy per baseline experiments.
@@ -41,24 +41,24 @@ SI_TEMPLATE = (
 )
 
 DSM_TEMPLATE = (
-    "https://data.geo.admin.ch/ch.swisstopo.swisssurface3d-raster/"
-    "swisssurface3d-raster_{year}_{coord}/"
-    "swisssurface3d-raster_{year}_{coord}_0.5_2056_5728.tif"
+    "https://data.geo.admin.ch/ch.swisstopo.swissalti3d/"
+    "swissalti3d_{year}_{coord}/"
+    "swissalti3d_{year}_{coord}_0.5_2056_5728.tif"
 )
 
 # STAC API
 STAC_BASE = "https://data.geo.admin.ch/api/stac/v0.9"
 SI_COLLECTION = "ch.swisstopo.swissimage-dop10"
-DSM_COLLECTION = "ch.swisstopo.swisssurface3d-raster"
+DSM_COLLECTION = "ch.swisstopo.swissalti3d"
 
 # Tile coordinate pattern (e.g. "2587-1133")
 COORD_RE = re.compile(r"(\d{4}-\d{4})")
 
-# Union of SwissIMAGE + swissSURFACE3D spatial extents (WGS84), from:
+# Union of SwissIMAGE + swissALTI3D spatial extents (WGS84), from:
 #   GET https://data.geo.admin.ch/api/stac/v0.9/collections/{collection}
 #   → extent.spatial.bbox
-# SwissIMAGE:     [5.9503666, 45.8151271, 10.4998461, 47.8091281]
-# swissSURFACE3D: [5.9503666, 45.7213375, 10.4998461, 47.8216742]
+# SwissIMAGE:   [5.9503666, 45.8151271, 10.4998461, 47.8091281]
+# swissALTI3D:  [5.9503666, 45.7213375, 10.4998461, 47.8216742]
 # We use the union so the STAC query returns all tiles from both layers;
 # query_stac_bbox() then intersects the results to keep only matched pairs.
 SWITZERLAND_BBOX = "5.95,45.72,10.50,47.83"
