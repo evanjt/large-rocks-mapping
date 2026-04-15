@@ -18,27 +18,17 @@ venv/
 # macOS-specific files
 .DS_Store
 
-# avoid pushing large data files
-data
+# Data and cache
+data/
 
-# the YOLO trained weigths
-runs/
-
-# YOLO models
-yolo*
-
-# config file
-config.yaml
-
-train*
-
-# wandb
-wandb
-*.geojson
-*.duckdb
+# Model weights
+models/
 *.pt
+
+# Pipeline outputs
+*.duckdb
 *.gpkg
 *.wal
-
-models/
+*.geojson
+runs/
 validation/

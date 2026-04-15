@@ -26,12 +26,19 @@ class TileCache:
 
     def get(self, url: str) -> bytes | None:
         path = self._dir / self._key(url)
-        if not path.exists():
+        try:
+            data = path.read_bytes()
+            if not data:
+                path.unlink(missing_ok=True)
+                return None
+            path.touch()
+            return data
+        except (FileNotFoundError, OSError):
             return None
-        path.touch()
-        return path.read_bytes()
 
     def put(self, url: str, data: bytes) -> None:
+        if not data:
+            return
         with self._lock:
             path = self._dir / self._key(url)
             path.write_bytes(data)
@@ -39,18 +46,25 @@ class TileCache:
 
     def _evict_if_needed(self) -> None:
         with self._lock:
-            files = list(self._dir.iterdir())
-            total = sum(f.stat().st_size for f in files)
+            files = []
+            total = 0
+            for f in self._dir.iterdir():
+                try:
+                    files.append((f, f.stat()))
+                except (FileNotFoundError, OSError):
+                    continue
+            total = sum(s.st_size for _, s in files)
             if total <= self._max_bytes:
                 return
-            files.sort(key=lambda f: f.stat().st_mtime)
-            for f in files:
+            files.sort(key=lambda x: x[1].st_mtime)
+            for f, s in files:
                 if total <= self._max_bytes:
                     break
-                size = f.stat().st_size
-                f.unlink()
-                total -= size
-                log.debug("Cache evicted %s (%dMB)", f.name, size // 1_000_000)
+                try:
+                    f.unlink()
+                except (FileNotFoundError, OSError):
+                    continue
+                total -= s.st_size
 
 
 _tile_cache: TileCache | None = None

@@ -145,10 +145,12 @@ The `--extra` must match the install step on every `uv run` call (`cuda` or `roc
 | `--device` | `auto` | PyTorch device (auto, cuda:0, cpu, etc.) |
 | `--download-threads` | `8` | Parallel download workers |
 | `--conf` | `0.10` | Confidence threshold |
-| `--iou` | `0.40` | IoU threshold |
+| `--iou` | `0.70` | IoU threshold |
 | `--no-dedup` | `false` | Disable 7.5m spatial deduplication |
 | `--rgb-year` | `0` | SwissIMAGE year (0 = newest available) |
 | `--dsm-year` | `0` | swissALTI3D year (0 = newest available) |
+| `--rgb-urls` | | CSV of SwissIMAGE URLs (one per line) |
+| `--dsm-urls` | | CSV of swissALTI3D URLs (one per line) |
 | `--cache-dir` | `data/tile_cache` | Tile cache directory |
 | `--cache-gb` | `500` | Max tile cache in GB, 0 to disable |
 | `--max-batch-tiles` | `8` | Tiles per GPU batch |

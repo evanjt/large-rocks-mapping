@@ -12,9 +12,11 @@ from typing import Optional
 from tqdm import tqdm
 
 from nationwide.db import (
+    get_cached_elevations,
     get_processed_tiles,
     init_db,
     mark_tile_done,
+    save_elevation,
     write_detections,
 )
 from nationwide.cache import get_cache_config, init_cache, set_stac_cache_dir
@@ -24,7 +26,6 @@ from nationwide.processing import (
     check_elevation,
     check_gdaldem,
     dedup_detections,
-    infer_on_files,
     infer_on_tensor,
     process_tile,
     reinit_session,
@@ -208,7 +209,6 @@ def run_pipeline(
     queue_maxsize: int = 0,
     batch_timeout: float = 0.5,
     no_dedup: bool = False,
-    file_inference: bool = False,
 ) -> None:
     """Main pipeline: download+preprocess -> infer -> dedup -> store.
 
@@ -240,26 +240,39 @@ def run_pipeline(
     if skipped:
         log.info(f"Checkpoint: skipping {skipped} already-processed tiles")
 
-    # --- 2. Elevation pre-filter ---
+    # --- 2. Elevation pre-filter (cached in DuckDB) ---
     elevation_skipped = 0
     if min_elevation > 0 and remaining:
         from concurrent.futures import ThreadPoolExecutor
 
-        log.info(f"Checking elevations for {len(remaining)} tiles ...")
+        cached_elevs = get_cached_elevations(con)
+        uncached = [(c, r, d) for c, r, d in remaining if c not in cached_elevs]
 
-        def _elev_ok(tile: tuple[str, str, str]) -> bool:
-            try:
-                return check_elevation(tile[2], min_elevation)
-            except Exception:
-                return True  # keep on error, let pipeline handle it
+        if uncached:
+            log.info(f"Checking elevations: {len(cached_elevs)} cached, {len(uncached)} to download ...")
 
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
-            passes = list(tqdm(
-                pool.map(_elev_ok, remaining),
-                total=len(remaining), desc="Elevation filter", unit="tile",
-            ))
+            def _get_elev(tile: tuple[str, str, str]) -> tuple[str, float]:
+                try:
+                    return (tile[0], check_elevation(tile[2]))
+                except Exception:
+                    return (tile[0], float("inf"))  # keep on error
+
+            with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
+                results = list(tqdm(
+                    pool.map(_get_elev, uncached),
+                    total=len(uncached), desc="Elevation filter", unit="tile",
+                ))
+            for coord, elev in results:
+                cached_elevs[coord] = elev
+                save_elevation(con, coord, elev)
+        else:
+            log.info(f"Elevation filter: all {len(remaining)} tiles cached")
+
         before = len(remaining)
-        remaining = [t for t, ok in zip(remaining, passes) if ok]
+        remaining = [
+            (c, r, d) for c, r, d in remaining
+            if cached_elevs.get(c, float("inf")) >= min_elevation
+        ]
         elevation_skipped = before - len(remaining)
         log.info(f"Eliminated {elevation_skipped} tiles below {min_elevation:.0f}m")
 
@@ -316,94 +329,73 @@ def run_pipeline(
 
     t0 = time.time()
 
-    # --- 7. Consumer loop ---
-    if file_inference:
-        # File-based inference: write patches to disk, let ultralytics
-        # handle image loading via cv2 — matches the training pipeline exactly.
-        sentinel_received = False
-        while not sentinel_received:
-            batch, batch_patches, sentinel_received = _collect_batch(
+    # --- 7. Double-buffered consumer loop ---
+    # GPU runs predict() on batch N while the main thread collects tiles
+    # and builds tensor for batch N+1. PyTorch releases the GIL during
+    # CUDA kernels, so a background thread can drive the GPU concurrently.
+    from concurrent.futures import ThreadPoolExecutor as _InferPool
+
+    infer_executor = _InferPool(max_workers=1)
+
+    # Prefetch first batch
+    batch, batch_patches, sentinel_received = _collect_batch(
+        tile_queue, max_batch_tiles, batch_timeout, stats, pbar, write_queue,
+    )
+    if batch_patches:
+        tensor, meta = build_batch_tensor(batch_patches, device)
+    else:
+        tensor, meta = None, None
+
+    while batch:
+        pbar.write(f"  >> Batch: {len(batch)} tiles, {len(batch_patches)} patches")
+
+        # Submit inference to background thread (GIL released during CUDA)
+        infer_future = infer_executor.submit(
+            infer_on_tensor, model, tensor, meta, conf, iou,
+        )
+
+        # While GPU works: collect + prepare next batch on CPU
+        if not sentinel_received:
+            next_batch, next_patches, sentinel_received = _collect_batch(
                 tile_queue, max_batch_tiles, batch_timeout,
                 stats, pbar, write_queue,
             )
-            if not batch_patches:
-                continue
-            pbar.write(f"  >> Batch: {len(batch)} tiles, {len(batch_patches)} patches (file mode)")
-            detections = infer_on_files(
-                model, batch_patches, conf=conf, iou=iou, device=device,
-            )
-            det_by_tile: dict[str, list] = defaultdict(list)
-            for det in detections:
-                det_by_tile[det.tile_id].append(det)
-            for tile_id, _patches in batch:
-                write_queue.put((tile_id, det_by_tile.get(tile_id, [])))
-    else:
-        # Double-buffered tensor inference: GPU runs predict() on batch N
-        # while the main thread collects tiles and builds tensor for batch N+1.
-        # PyTorch releases the GIL during CUDA kernels.
-        from concurrent.futures import ThreadPoolExecutor as _InferPool
-
-        infer_executor = _InferPool(max_workers=1)
-
-        # Prefetch first batch
-        batch, batch_patches, sentinel_received = _collect_batch(
-            tile_queue, max_batch_tiles, batch_timeout, stats, pbar, write_queue,
-        )
-        if batch_patches:
-            tensor, meta = build_batch_tensor(batch_patches, device)
-        else:
-            tensor, meta = None, None
-
-        while batch:
-            pbar.write(f"  >> Batch: {len(batch)} tiles, {len(batch_patches)} patches")
-
-            # Submit inference to background thread (GIL released during CUDA)
-            infer_future = infer_executor.submit(
-                infer_on_tensor, model, tensor, meta, conf, iou,
-            )
-
-            # While GPU works: collect + prepare next batch on CPU
-            if not sentinel_received:
-                next_batch, next_patches, sentinel_received = _collect_batch(
-                    tile_queue, max_batch_tiles, batch_timeout,
-                    stats, pbar, write_queue,
-                )
-                if next_patches:
-                    next_tensor, next_meta = build_batch_tensor(next_patches, device)
-                else:
-                    next_tensor, next_meta = None, None
+            if next_patches:
+                next_tensor, next_meta = build_batch_tensor(next_patches, device)
             else:
-                next_batch, next_patches = [], []
                 next_tensor, next_meta = None, None
+        else:
+            next_batch, next_patches = [], []
+            next_tensor, next_meta = None, None
 
-            # Wait for inference result
-            try:
-                detections = infer_future.result()
-            except (RuntimeError, Exception) as exc:
-                if "out of memory" in str(exc).lower():
-                    import torch
-                    torch.cuda.empty_cache()
-                    log.warning("OOM in double-buffer, falling back to run_inference")
-                    detections = run_inference(
-                        model, batch_patches, conf=conf, iou=iou, device=device,
-                        max_patches_per_call=len(batch_patches) // 2,
-                    )
-                else:
-                    raise
+        # Wait for inference result
+        try:
+            detections = infer_future.result()
+        except (RuntimeError, Exception) as exc:
+            if "out of memory" in str(exc).lower():
+                import torch
+                torch.cuda.empty_cache()
+                log.warning("OOM in double-buffer, falling back to run_inference")
+                detections = run_inference(
+                    model, batch_patches, conf=conf, iou=iou, device=device,
+                    max_patches_per_call=len(batch_patches) // 2,
+                )
+            else:
+                raise
 
-            # Distribute detections to writer by tile
-            det_by_tile: dict[str, list] = defaultdict(list)
-            for det in detections:
-                det_by_tile[det.tile_id].append(det)
+        # Distribute detections to writer by tile
+        det_by_tile: dict[str, list] = defaultdict(list)
+        for det in detections:
+            det_by_tile[det.tile_id].append(det)
 
-            for tile_id, _patches in batch:
-                write_queue.put((tile_id, det_by_tile.get(tile_id, [])))
+        for tile_id, _patches in batch:
+            write_queue.put((tile_id, det_by_tile.get(tile_id, [])))
 
-            # Swap: next becomes current
-            batch, batch_patches = next_batch, next_patches
-            tensor, meta = next_tensor, next_meta
+        # Swap: next becomes current
+        batch, batch_patches = next_batch, next_patches
+        tensor, meta = next_tensor, next_meta
 
-        infer_executor.shutdown(wait=True)
+    infer_executor.shutdown(wait=True)
 
     # --- 8. Shutdown ---
     write_queue.put(None)
@@ -487,7 +479,6 @@ def run(
     dsm_year: int = typer.Option(0, "--dsm-year", help="swissALTI3D year (0=newest)"),
     rgb_url_csv: Optional[Path] = typer.Option(None, "--rgb-urls", help="CSV of SwissIMAGE URLs (one per line)"),
     dsm_url_csv: Optional[Path] = typer.Option(None, "--dsm-urls", help="CSV of swissALTI3D URLs (one per line)"),
-    file_inference: bool = typer.Option(False, "--file-inference", help="Write patches to disk for inference (matches training pipeline exactly)"),
 ) -> None:
     """Run the rock detection pipeline on Swisstopo tiles."""
     if model is None:
@@ -553,5 +544,4 @@ def run(
         queue_maxsize=queue_size,
         batch_timeout=batch_timeout,
         no_dedup=no_dedup,
-        file_inference=file_inference,
     )

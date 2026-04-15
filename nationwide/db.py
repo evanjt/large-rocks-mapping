@@ -29,6 +29,14 @@ CREATE TABLE IF NOT EXISTS processed_tiles (
 );
 """
 
+_DB_SCHEMA_ELEVATIONS = """
+CREATE TABLE IF NOT EXISTS tile_elevations (
+    coord        VARCHAR PRIMARY KEY,
+    max_elev     FLOAT,
+    checked_at   TIMESTAMP DEFAULT current_timestamp
+);
+"""
+
 
 @dataclass
 class Detection:
@@ -51,6 +59,7 @@ def init_db(db_path: str | Path) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(str(db_path))
     con.execute(_DB_SCHEMA_DETECTIONS)
     con.execute(_DB_SCHEMA_CHECKPOINTS)
+    con.execute(_DB_SCHEMA_ELEVATIONS)
     return con
 
 
@@ -69,6 +78,23 @@ def mark_tile_done(
         "ON CONFLICT (tile_id) DO UPDATE SET "
         "n_detections = excluded.n_detections, processed_at = NOW()",
         [tile_id, n_detections],
+    )
+
+
+def get_cached_elevations(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
+    """Return {coord: max_elevation} for all cached tiles."""
+    rows = con.execute("SELECT coord, max_elev FROM tile_elevations").fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def save_elevation(
+    con: duckdb.DuckDBPyConnection, coord: str, max_elev: float,
+) -> None:
+    """Cache a tile's max elevation."""
+    con.execute(
+        "INSERT INTO tile_elevations (coord, max_elev) VALUES (?, ?) "
+        "ON CONFLICT (coord) DO UPDATE SET max_elev = excluded.max_elev",
+        [coord, max_elev],
     )
 
 
