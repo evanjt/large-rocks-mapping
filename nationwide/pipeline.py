@@ -31,7 +31,7 @@ from nationwide.processing import (
     reinit_session,
     run_inference,
 )
-from nationwide.spatial import load_url_csvs, query_stac_bbox, resolve_batch
+from nationwide.spatial import load_url_csvs, query_stac_bbox, resolve_batch, resolve_tile_urls
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,16 +43,24 @@ log = logging.getLogger(__name__)
 
 def _safe_process(
     coord: str, rgb_url: str, dsm_url: str,
+    neighbor_right: tuple[str, str] | None = None,
+    neighbor_bottom: tuple[str, str] | None = None,
+    neighbor_corner: tuple[str, str] | None = None,
 ) -> tuple[str, list | Exception]:
     """Process single tile, catching exceptions for graceful error handling"""
     try:
-        return (coord, process_tile(coord, rgb_url, dsm_url))
+        return (coord, process_tile(
+            coord, rgb_url, dsm_url,
+            neighbor_right=neighbor_right,
+            neighbor_bottom=neighbor_bottom,
+            neighbor_corner=neighbor_corner,
+        ))
     except Exception as exc:
         return (coord, exc)
 
 
 def _producer_thread(
-    tiles: list[tuple[str, str, str]],
+    tiles: list[tuple],
     tile_queue: queue.Queue,
     download_threads: int,
 ) -> None:
@@ -60,6 +68,7 @@ def _producer_thread(
 
     Uses ProcessPoolExecutor for true CPU parallelism — avoids GIL
     contention during rasterio TIFF decompression and numpy processing.
+    Each tile entry is (coord, rgb_url, dsm_url, neighbor_right, neighbor_bottom, neighbor_corner).
     """
     cc = get_cache_config()
     base = (cc[0], cc[1]) if cc else (None, 0)
@@ -75,8 +84,8 @@ def _producer_thread(
 
         for _ in range(download_threads):
             try:
-                c, r, d = next(src)
-                pending[pool.submit(_safe_process, c, r, d)] = True
+                entry = next(src)
+                pending[pool.submit(_safe_process, *entry)] = True
             except StopIteration:
                 break
 
@@ -89,8 +98,8 @@ def _producer_thread(
             tile_queue.put(future.result())
 
             try:
-                c, r, d = next(src)
-                pending[pool.submit(_safe_process, c, r, d)] = True
+                entry = next(src)
+                pending[pool.submit(_safe_process, *entry)] = True
             except StopIteration:
                 pass
 
@@ -283,12 +292,52 @@ def run_pipeline(
         con.close()
         return
 
-    # --- 3. Start producer (downloads tiles while model loads) ---
+    # --- 3. Build neighbor lookup and start producer ---
+    # All resolved tiles (including elevation-filtered ones) can serve as neighbors
+    url_lookup: dict[str, tuple[str, str]] = {c: (r, d) for c, r, d in tile_source}
+
+    def _resolve_neighbor(coord: str) -> tuple[str, str] | None:
+        """Look up neighbor URLs, falling back to HEAD scan if outside bbox."""
+        cached = url_lookup.get(coord)
+        if cached is not None:
+            return cached
+        pair = resolve_tile_urls(coord)
+        if pair is not None:
+            url_lookup[coord] = pair
+        return pair
+
+    log.info("Resolving neighbor tile URLs ...")
+    neighbor_coords: set[str] = set()
+    for c, _, _ in remaining:
+        parts = c.split("-")
+        x, y = int(parts[0]), int(parts[1])
+        for nc in [f"{x+1}-{y}", f"{x}-{y-1}", f"{x+1}-{y-1}"]:
+            if nc not in url_lookup:
+                neighbor_coords.add(nc)
+
+    if neighbor_coords:
+        from nationwide.spatial import resolve_batch as _resolve_neighbors
+        resolved = _resolve_neighbors(list(neighbor_coords), threads=download_threads)
+        url_lookup.update(resolved)
+        log.info(f"  Resolved {len(resolved)}/{len(neighbor_coords)} neighbor tiles outside bbox")
+
+    def _neighbor_urls(coord: str) -> tuple:
+        parts = coord.split("-")
+        x, y = int(parts[0]), int(parts[1])
+        right = url_lookup.get(f"{x+1}-{y}")
+        bottom = url_lookup.get(f"{x}-{y-1}")
+        corner = url_lookup.get(f"{x+1}-{y-1}")
+        return right, bottom, corner
+
+    tiles_with_neighbors = [
+        (c, r, d, *_neighbor_urls(c)) for c, r, d in remaining
+    ]
+
     tile_queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
 
     producer = threading.Thread(
         target=_producer_thread,
-        args=(remaining, tile_queue, download_threads),
+        args=(tiles_with_neighbors, tile_queue, download_threads),
         daemon=True,
     )
     producer.start()

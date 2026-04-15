@@ -35,6 +35,12 @@ SRC_STRIDE_DSM = int(STRIDE_GROUND_M / DSM_RES)         # 430px
 SRC_CROP_RGB = int(TILE_GROUND_M / SWISSIMAGE_RES)      # 3200px at 10cm
 SRC_STRIDE_RGB = int(STRIDE_GROUND_M / SWISSIMAGE_RES)  # 2150px at 10cm
 
+# Neighbor strip sizes for cross-tile stitching (5th patch extends past tile edge)
+TILE_PX_DSM = int(1000 / DSM_RES)                       # 2000px
+TILE_PX_RGB = int(1000 / SWISSIMAGE_RES)                 # 10000px
+NEIGHBOR_STRIP_DSM = 4 * SRC_STRIDE_DSM + SRC_CROP_DSM - TILE_PX_DSM  # 360px
+NEIGHBOR_STRIP_RGB = 4 * SRC_STRIDE_RGB + SRC_CROP_RGB - TILE_PX_RGB  # 1800px
+
 # Swisstopo CDN URL templates (year + coord are filled at runtime)
 SI_TEMPLATE = (
     "https://data.geo.admin.ch/ch.swisstopo.swissimage-dop10/"

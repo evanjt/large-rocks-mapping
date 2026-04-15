@@ -18,8 +18,10 @@ from rasterio.windows import Window
 from nationwide.cache import cache_get, cache_put, reinit_cache
 from nationwide.db import Detection
 from utils.constants import (
-    FUSION_CHANNEL, SRC_CROP_DSM, SRC_CROP_RGB,
-    SRC_STRIDE_DSM, SRC_STRIDE_RGB, TILE_SIZE_PX,
+    FUSION_CHANNEL, NEIGHBOR_STRIP_DSM, NEIGHBOR_STRIP_RGB,
+    SRC_CROP_DSM, SRC_CROP_RGB,
+    SRC_STRIDE_DSM, SRC_STRIDE_RGB, TILE_PX_DSM, TILE_PX_RGB,
+    TILE_SIZE_PX,
 )
 
 log = logging.getLogger(__name__)
@@ -279,58 +281,162 @@ def check_elevation(dsm_url: str) -> float:
             return float(src.read(1).max())
 
 
+def _read_strip(tile_bytes: bytes, band_count: int,
+                 col_off: int, row_off: int,
+                 width: int, height: int) -> np.ndarray:
+    """Read a pixel strip from tile bytes via MemoryFile."""
+    with rasterio.io.MemoryFile(tile_bytes) as mf:
+        with mf.open() as src:
+            return src.read(
+                indexes=list(range(1, band_count + 1)),
+                window=Window(col_off, row_off, width, height),
+            )
+
+
+def _stitch_and_write(center_bytes: bytes, band_count: int,
+                      right_bytes: bytes | None,
+                      bottom_bytes: bytes | None,
+                      corner_bytes: bytes | None,
+                      tile_px: int, strip_px: int) -> tuple[str, rasterio.Affine]:
+    """Stitch center tile with neighbor strips and write to temp file.
+
+    Returns (temp_file_path, transform). Caller must delete the file.
+    """
+    with rasterio.io.MemoryFile(center_bytes) as mf:
+        with mf.open() as src:
+            center = src.read(indexes=list(range(1, band_count + 1)))
+            transform = src.transform
+            dtype = src.dtypes[0]
+            crs = src.crs
+
+    has_right = right_bytes is not None
+    has_bottom = bottom_bytes is not None
+    has_corner = corner_bytes is not None and has_right and has_bottom
+
+    ext_w = tile_px + (strip_px if has_right else 0)
+    ext_h = tile_px + (strip_px if has_bottom else 0)
+
+    if band_count == 1:
+        extended = np.zeros((ext_h, ext_w), dtype=center.dtype)
+        extended[:tile_px, :tile_px] = center[0]
+    else:
+        extended = np.zeros((band_count, ext_h, ext_w), dtype=center.dtype)
+        extended[:, :tile_px, :tile_px] = center
+    del center
+
+    if has_right:
+        strip = _read_strip(right_bytes, band_count, 0, 0, strip_px, tile_px)
+        if band_count == 1:
+            extended[:tile_px, tile_px:] = strip[0]
+        else:
+            extended[:, :tile_px, tile_px:] = strip
+
+    if has_bottom:
+        strip = _read_strip(bottom_bytes, band_count, 0, 0, tile_px, strip_px)
+        if band_count == 1:
+            extended[tile_px:, :tile_px] = strip[0]
+        else:
+            extended[:, tile_px:, :tile_px] = strip
+
+    if has_corner:
+        strip = _read_strip(corner_bytes, band_count, 0, 0, strip_px, strip_px)
+        if band_count == 1:
+            extended[tile_px:, tile_px:] = strip[0]
+        else:
+            extended[:, tile_px:, tile_px:] = strip
+
+    fd, path = tempfile.mkstemp(suffix=".tif")
+    os.close(fd)
+    with rasterio.open(
+        path, "w", driver="GTiff",
+        width=ext_w, height=ext_h,
+        count=band_count, dtype=dtype,
+        crs=crs, transform=transform,
+    ) as dst:
+        if band_count == 1:
+            dst.write(extended, 1)
+        else:
+            dst.write(extended)
+
+    return path, transform
+
+
 def process_tile(
     coord: str,
     rgb_url: str,
     dsm_url: str,
+    neighbor_right: tuple[str, str] | None = None,
+    neighbor_bottom: tuple[str, str] | None = None,
+    neighbor_corner: tuple[str, str] | None = None,
 ) -> list[tuple[np.ndarray, rasterio.Affine, int, int, str, str, str]]:
-    """Download, hillshade, crop, and fuse one tile entirely in memory.
+    """Download, hillshade, crop, and fuse one tile with cross-tile stitching.
 
-    Returns list of (fused_patch, transform, row, col, tile_id, rgb_url, dsm_url).
-    Each fused_patch is (3, 640, 640) uint8.
+    Downloads neighbor tiles' edge strips to extend the patch grid past
+    tile boundaries. Generates hillshade on the stitched DSM for correct
+    slope at boundaries. Returns 5×5=25 patches (vs 4×4=16 without neighbors).
     """
-    with ThreadPoolExecutor(max_workers=2) as dl_pool:
-        rgb_future = dl_pool.submit(download_to_memory, rgb_url)
-        dsm_future = dl_pool.submit(download_to_memory, dsm_url)
-        rgb_bytes = rgb_future.result()
-        dsm_bytes = dsm_future.result()
+    # Download center + neighbor tiles in parallel
+    urls_to_fetch = [rgb_url, dsm_url]
+    labels = ["rgb", "dsm"]
+    if neighbor_right:
+        urls_to_fetch.extend(neighbor_right)
+        labels.extend(["rgb_right", "dsm_right"])
+    if neighbor_bottom:
+        urls_to_fetch.extend(neighbor_bottom)
+        labels.extend(["rgb_bottom", "dsm_bottom"])
+    if neighbor_corner:
+        urls_to_fetch.extend(neighbor_corner)
+        labels.extend(["rgb_corner", "dsm_corner"])
 
-    # Write DSM bytes to temp file (gdaldem needs a file)
-    fd, dsm_path = tempfile.mkstemp(suffix=".tif")
-    os.close(fd)
-    with open(dsm_path, "wb") as f:
-        f.write(dsm_bytes)
-    del dsm_bytes
-    try:
-        with rasterio.open(dsm_path) as src:
-            dsm_transform = src.transform
+    with ThreadPoolExecutor(max_workers=len(urls_to_fetch)) as dl_pool:
+        futures = {label: dl_pool.submit(download_to_memory, url)
+                   for label, url in zip(labels, urls_to_fetch)}
+        downloaded = {label: f.result() for label, f in futures.items()}
+
+    rgb_bytes = downloaded["rgb"]
+    dsm_bytes = downloaded["dsm"]
+    dsm_right = downloaded.get("dsm_right")
+    dsm_bottom = downloaded.get("dsm_bottom")
+    dsm_corner = downloaded.get("dsm_corner")
+    rgb_right = downloaded.get("rgb_right")
+    rgb_bottom = downloaded.get("rgb_bottom")
+    rgb_corner = downloaded.get("rgb_corner")
+
+    # Get tile bounds from center DSM for tile_id
+    with rasterio.io.MemoryFile(dsm_bytes) as mf:
+        with mf.open() as src:
             dsm_bounds = src.bounds
 
+    # Stitch DSM + generate hillshade on extended raster
+    dsm_path, dsm_transform = _stitch_and_write(
+        dsm_bytes, 1, dsm_right, dsm_bottom, dsm_corner,
+        TILE_PX_DSM, NEIGHBOR_STRIP_DSM,
+    )
+    del dsm_bytes, dsm_right, dsm_bottom, dsm_corner
+
+    try:
         hillshade = generate_hillshade(dsm_path)
     finally:
         Path(dsm_path).unlink(missing_ok=True)
 
-    # DSM already at target res — no resampling needed
+    hs_h, hs_w = hillshade.shape
     hs_patches = crop_patches(
         hillshade, dsm_transform,
         crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM, out_px=TILE_SIZE_PX,
     )
     del hillshade
 
-    # Write RGB to temp file for per-patch gdal_translate (matches training)
-    fd_rgb, rgb_path = tempfile.mkstemp(suffix=".tif")
-    os.close(fd_rgb)
-    with open(rgb_path, "wb") as f:
-        f.write(rgb_bytes)
-    del rgb_bytes
+    # Stitch RGB + extract patches
+    rgb_path, _ = _stitch_and_write(
+        rgb_bytes, 3, rgb_right, rgb_bottom, rgb_corner,
+        TILE_PX_RGB, NEIGHBOR_STRIP_RGB,
+    )
+    del rgb_bytes, rgb_right, rgb_bottom, rgb_corner
 
     try:
         with rasterio.open(rgb_path) as src:
             rgb_width, rgb_height = src.width, src.height
-            rgb_transform = src.transform
-        rgb_patches = _crop_resample_rgb(
-            rgb_path, rgb_width, rgb_height,
-        )
+        rgb_patches = _crop_resample_rgb(rgb_path, rgb_width, rgb_height)
     finally:
         Path(rgb_path).unlink(missing_ok=True)
 
