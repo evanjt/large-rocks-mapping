@@ -151,6 +151,41 @@ def load_stac_cache(bbox: str) -> list[tuple[str, str, str]] | None:
         return None
 
 
+def load_neighbor_cache() -> dict[str, tuple[str, str]]:
+    """Load cached neighbor tile URLs. Returns {coord: (rgb_url, dsm_url)}."""
+    if _stac_cache_path is None or not _stac_cache_path.exists():
+        return {}
+    try:
+        con = duckdb.connect(str(_stac_cache_path), read_only=True)
+        rows = con.execute("SELECT coord, rgb_url, dsm_url FROM neighbor_cache").fetchall()
+        con.close()
+        return {c: (r, d) for c, r, d in rows}
+    except Exception:
+        return {}
+
+
+def save_neighbor_cache(resolved: dict[str, tuple[str, str]]) -> None:
+    """Persist resolved neighbor tile URLs to cache."""
+    if _stac_cache_path is None or not resolved:
+        return
+    try:
+        con = duckdb.connect(str(_stac_cache_path))
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS neighbor_cache (
+                coord    VARCHAR PRIMARY KEY,
+                rgb_url  VARCHAR NOT NULL,
+                dsm_url  VARCHAR NOT NULL
+            )
+        """)
+        con.executemany(
+            "INSERT OR REPLACE INTO neighbor_cache (coord, rgb_url, dsm_url) VALUES (?, ?, ?)",
+            [(c, r, d) for c, (r, d) in resolved.items()],
+        )
+        con.close()
+    except Exception as exc:
+        log.warning(f"Neighbor cache write failed: {exc}")
+
+
 def save_stac_cache(bbox: str, tiles: list[tuple[str, str, str]]) -> None:
     """Persist STAC results to the cache DuckDB."""
     if _stac_cache_path is None:

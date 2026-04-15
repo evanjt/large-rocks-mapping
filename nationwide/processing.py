@@ -95,6 +95,40 @@ def generate_hillshade(dsm_path: str | Path) -> np.ndarray:
         Path(out_path).unlink(missing_ok=True)
 
 
+def _get_hillshade(dsm_bytes: bytes, dsm_url: str) -> tuple[np.ndarray, rasterio.Affine]:
+    """Generate hillshade from DSM bytes, caching in the tile cache.
+
+    Cache key: dsm filename with '_hs' suffix (e.g. swissalti3d_..._hs.npy).
+    Returns (hillshade_array, dsm_transform).
+    """
+    from nationwide.cache import cache_get, cache_put
+
+    hs_cache_key = dsm_url.replace(".tif", "_hs.npy")
+    cached = cache_get(hs_cache_key)
+    if cached is not None:
+        with rasterio.io.MemoryFile(dsm_bytes) as mf:
+            with mf.open() as src:
+                transform = src.transform
+        hillshade = np.frombuffer(cached, dtype=np.uint8).reshape(
+            TILE_PX_DSM, TILE_PX_DSM,
+        )
+        return hillshade, transform
+
+    fd, dsm_path = tempfile.mkstemp(suffix=".tif")
+    os.close(fd)
+    with open(dsm_path, "wb") as f:
+        f.write(dsm_bytes)
+    try:
+        with rasterio.open(dsm_path) as src:
+            transform = src.transform
+        hillshade = generate_hillshade(dsm_path)
+    finally:
+        Path(dsm_path).unlink(missing_ok=True)
+
+    cache_put(hs_cache_key, hillshade.tobytes())
+    return hillshade, transform
+
+
 def crop_patches(
     data: np.ndarray,
     transform: rasterio.Affine,
@@ -361,6 +395,59 @@ def _stitch_and_write(center_bytes: bytes, band_count: int,
     return path, transform
 
 
+def _patch_cache_key(coord: str, has_neighbors: bool) -> str:
+    """Cache key for fused patches. Includes neighbor flag so cached
+    patches with/without stitching don't collide."""
+    suffix = "_stitched" if has_neighbors else ""
+    return f"patches_{coord}{suffix}.npz"
+
+
+def _save_patch_cache(key: str, results: list[tuple]) -> None:
+    """Save fused patches + transforms to tile cache."""
+    arrays = []
+    transforms = []
+    rows_cols = []
+    for patch, tf, row, col, *_ in results:
+        arrays.append(patch)
+        transforms.append((tf.a, tf.c, tf.e, tf.f))
+        rows_cols.append((row, col))
+    from nationwide.cache import cache_put
+    import io
+    buf = io.BytesIO()
+    np.savez_compressed(
+        buf,
+        patches=np.stack(arrays),
+        transforms=np.array(transforms),
+        rows_cols=np.array(rows_cols),
+    )
+    cache_put(key, buf.getvalue())
+
+
+def _load_patch_cache(
+    key: str, tile_id: str, rgb_url: str, dsm_url: str,
+) -> list[tuple] | None:
+    """Load cached fused patches. Returns None on miss."""
+    from nationwide.cache import cache_get
+    data = cache_get(key)
+    if data is None:
+        return None
+    try:
+        import io
+        npz = np.load(io.BytesIO(data))
+        patches = npz["patches"]
+        transforms = npz["transforms"]
+        rows_cols = npz["rows_cols"]
+        results = []
+        for i in range(len(patches)):
+            a, c, e, f = transforms[i]
+            tf = rasterio.Affine(a, 0, c, 0, e, f)
+            row, col = int(rows_cols[i][0]), int(rows_cols[i][1])
+            results.append((patches[i], tf, row, col, tile_id, rgb_url, dsm_url))
+        return results
+    except Exception:
+        return None
+
+
 def process_tile(
     coord: str,
     rgb_url: str,
@@ -371,10 +458,19 @@ def process_tile(
 ) -> list[tuple[np.ndarray, rasterio.Affine, int, int, str, str, str]]:
     """Download, hillshade, crop, and fuse one tile with cross-tile stitching.
 
-    Downloads neighbor tiles' edge strips to extend the patch grid past
-    tile boundaries. Generates hillshade on the stitched DSM for correct
-    slope at boundaries. Returns 5×5=25 patches (vs 4×4=16 without neighbors).
+    Caches the final fused patches so subsequent runs skip all preprocessing.
     """
+    has_neighbors = bool(neighbor_right or neighbor_bottom or neighbor_corner)
+
+    # Derive tile_id from coord (e.g. "2587-1133" → "2587_1133")
+    tile_id = coord.replace("-", "_")
+
+    # Check patch cache — if hit, skip ALL preprocessing
+    cache_key = _patch_cache_key(coord, has_neighbors)
+    cached = _load_patch_cache(cache_key, tile_id, rgb_url, dsm_url)
+    if cached is not None:
+        return cached
+
     # Download center + neighbor tiles in parallel
     urls_to_fetch = [rgb_url, dsm_url]
     labels = ["rgb", "dsm"]
@@ -402,60 +498,67 @@ def process_tile(
     rgb_bottom = downloaded.get("rgb_bottom")
     rgb_corner = downloaded.get("rgb_corner")
 
-    has_neighbors = dsm_right or dsm_bottom or dsm_corner
+    # --- Generate all hillshades in parallel (center + neighbors) ---
+    hs_jobs: dict[str, tuple[bytes, str]] = {"center": (dsm_bytes, dsm_url)}
+    if dsm_right:
+        hs_jobs["right"] = (dsm_right, neighbor_right[1])
+    if dsm_bottom:
+        hs_jobs["bottom"] = (dsm_bottom, neighbor_bottom[1])
+    if dsm_corner:
+        hs_jobs["corner"] = (dsm_corner, neighbor_corner[1])
 
-    # --- Center tile: write original bytes directly (preserves file structure) ---
-    fd_dsm, dsm_center_path = tempfile.mkstemp(suffix=".tif")
-    os.close(fd_dsm)
-    with open(dsm_center_path, "wb") as f:
-        f.write(dsm_bytes)
+    with ThreadPoolExecutor(max_workers=len(hs_jobs)) as hs_pool:
+        hs_futures = {
+            name: hs_pool.submit(_get_hillshade, data, url)
+            for name, (data, url) in hs_jobs.items()
+        }
+        hs_results = {name: f.result() for name, f in hs_futures.items()}
 
+    center_hs, dsm_transform = hs_results["center"]
+    hs_patches = crop_patches(
+        center_hs, dsm_transform,
+        crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM, out_px=TILE_SIZE_PX,
+    )
+
+    # --- Cross-boundary hillshade: stitch neighbor hillshades ---
+    if has_neighbors:
+        right_hs = hs_results["right"][0] if "right" in hs_results else None
+        bottom_hs = hs_results["bottom"][0] if "bottom" in hs_results else None
+        corner_hs = hs_results["corner"][0] if "corner" in hs_results else None
+
+        ext_h = TILE_PX_DSM + (NEIGHBOR_STRIP_DSM if bottom_hs is not None else 0)
+        ext_w = TILE_PX_DSM + (NEIGHBOR_STRIP_DSM if right_hs is not None else 0)
+        extended_hs = np.zeros((ext_h, ext_w), dtype=center_hs.dtype)
+        extended_hs[:TILE_PX_DSM, :TILE_PX_DSM] = center_hs
+        if right_hs is not None:
+            extended_hs[:TILE_PX_DSM, TILE_PX_DSM:] = right_hs[:, :NEIGHBOR_STRIP_DSM]
+        if bottom_hs is not None:
+            extended_hs[TILE_PX_DSM:, :TILE_PX_DSM] = bottom_hs[:NEIGHBOR_STRIP_DSM, :]
+        if corner_hs is not None and right_hs is not None and bottom_hs is not None:
+            extended_hs[TILE_PX_DSM:, TILE_PX_DSM:] = corner_hs[:NEIGHBOR_STRIP_DSM, :NEIGHBOR_STRIP_DSM]
+
+        ext_hs_patches = crop_patches(
+            extended_hs, dsm_transform,
+            crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM, out_px=TILE_SIZE_PX,
+        )
+        hs_patches.extend(p for p in ext_hs_patches if p[2] >= 4 or p[3] >= 4)
+        del extended_hs, right_hs, bottom_hs, corner_hs
+
+    del center_hs, dsm_bytes, dsm_right, dsm_bottom, dsm_corner
+
+    # --- Center RGB: from original file (preserves compression/block layout) ---
     fd_rgb, rgb_center_path = tempfile.mkstemp(suffix=".tif")
     os.close(fd_rgb)
     with open(rgb_center_path, "wb") as f:
         f.write(rgb_bytes)
 
     try:
-        with rasterio.open(dsm_center_path) as src:
-            dsm_transform = src.transform
-            dsm_bounds = src.bounds
-
-        # Center 4×4 hillshade: from original DSM (no stitching artifacts)
-        center_hillshade = generate_hillshade(dsm_center_path)
-        hs_patches = crop_patches(
-            center_hillshade, dsm_transform,
-            crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM, out_px=TILE_SIZE_PX,
-        )
-        del center_hillshade
-
-        # Center 4×4 RGB: from original file (preserves compression/block layout)
         with rasterio.open(rgb_center_path) as src:
             rgb_width, rgb_height = src.width, src.height
-        rgb_patches = _crop_resample_rgb(
-            rgb_center_path, rgb_width, rgb_height,
-        )
+        rgb_patches = _crop_resample_rgb(rgb_center_path, rgb_width, rgb_height)
 
-        # --- Cross-boundary patches (5th row/col): from stitched rasters ---
+        # --- Cross-boundary RGB: stitch neighbor strips ---
         if has_neighbors:
-            dsm_ext_path, dsm_ext_tf = _stitch_and_write(
-                dsm_bytes, 1, dsm_right, dsm_bottom, dsm_corner,
-                TILE_PX_DSM, NEIGHBOR_STRIP_DSM,
-            )
-            try:
-                ext_hillshade = generate_hillshade(dsm_ext_path)
-                ext_hs_patches = crop_patches(
-                    ext_hillshade, dsm_ext_tf,
-                    crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM,
-                    out_px=TILE_SIZE_PX,
-                )
-                del ext_hillshade
-                # Keep only patches beyond the 4×4 center grid
-                hs_patches.extend(
-                    p for p in ext_hs_patches if p[2] >= 4 or p[3] >= 4
-                )
-            finally:
-                Path(dsm_ext_path).unlink(missing_ok=True)
-
             rgb_ext_path, _ = _stitch_and_write(
                 rgb_bytes, 3, rgb_right, rgb_bottom, rgb_corner,
                 TILE_PX_RGB, NEIGHBOR_STRIP_RGB,
@@ -469,25 +572,21 @@ def process_tile(
                 )
             finally:
                 Path(rgb_ext_path).unlink(missing_ok=True)
-
     finally:
-        Path(dsm_center_path).unlink(missing_ok=True)
         Path(rgb_center_path).unlink(missing_ok=True)
 
-    del dsm_bytes, dsm_right, dsm_bottom, dsm_corner
     del rgb_bytes, rgb_right, rgb_bottom, rgb_corner
 
-    # LV95 km grid
-    grid_x = int(dsm_bounds.left) // 1000
-    grid_y = int(dsm_bounds.bottom) // 1000
-    tile_id = f"{grid_x}_{grid_y}"
-
+    # --- Fuse RGB + hillshade ---
     results = []
     for (hs_patch, hs_tf, row, col), (rgb_patch, _, _, _) in zip(
         hs_patches, rgb_patches,
     ):
         rgb_patch[FUSION_CHANNEL] = hs_patch
         results.append((rgb_patch, hs_tf, row, col, tile_id, rgb_url, dsm_url))
+
+    # Cache the fused patches for future runs
+    _save_patch_cache(cache_key, results)
 
     return results
 

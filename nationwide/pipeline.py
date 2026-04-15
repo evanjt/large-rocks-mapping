@@ -19,7 +19,10 @@ from nationwide.db import (
     save_elevation,
     write_detections,
 )
-from nationwide.cache import get_cache_config, init_cache, set_stac_cache_dir
+from nationwide.cache import (
+    get_cache_config, init_cache, load_neighbor_cache,
+    save_neighbor_cache, set_stac_cache_dir,
+)
 from utils.constants import SWITZERLAND_BBOX, TILE_SIZE_PX
 from nationwide.processing import (
     build_batch_tensor,
@@ -74,6 +77,8 @@ def _producer_thread(
     base = (cc[0], cc[1]) if cc else (None, 0)
     init_args = base
 
+    pbar = tqdm(total=len(tiles), desc="Preprocessing", unit="tile", position=1, leave=False)
+
     with ProcessPoolExecutor(
         max_workers=download_threads,
         initializer=reinit_session,
@@ -96,6 +101,8 @@ def _producer_thread(
             future = done.pop()
             del pending[future]
             tile_queue.put(future.result())
+            pbar.update(1)
+            pbar.set_postfix(queued=tile_queue.qsize())
 
             try:
                 entry = next(src)
@@ -103,6 +110,7 @@ def _producer_thread(
             except StopIteration:
                 pass
 
+    pbar.close()
     tile_queue.put(None)  # Sentinel
 
 
@@ -306,7 +314,10 @@ def run_pipeline(
             url_lookup[coord] = pair
         return pair
 
-    log.info("Resolving neighbor tile URLs ...")
+    # Load cached neighbor URLs, then resolve any remaining via HEAD scan
+    cached_neighbors = load_neighbor_cache()
+    url_lookup.update(cached_neighbors)
+
     neighbor_coords: set[str] = set()
     for c, _, _ in remaining:
         parts = c.split("-")
@@ -316,10 +327,14 @@ def run_pipeline(
                 neighbor_coords.add(nc)
 
     if neighbor_coords:
+        log.info(f"Resolving {len(neighbor_coords)} neighbor tile URLs ({len(cached_neighbors)} cached) ...")
         from nationwide.spatial import resolve_batch as _resolve_neighbors
         resolved = _resolve_neighbors(list(neighbor_coords), threads=download_threads)
         url_lookup.update(resolved)
-        log.info(f"  Resolved {len(resolved)}/{len(neighbor_coords)} neighbor tiles outside bbox")
+        save_neighbor_cache({**cached_neighbors, **resolved})
+        log.info(f"  Resolved {len(resolved)}/{len(neighbor_coords)} neighbor tiles")
+    else:
+        log.info(f"All neighbor tile URLs cached ({len(cached_neighbors)} entries)")
 
     def _neighbor_urls(coord: str) -> tuple:
         parts = coord.split("-")
