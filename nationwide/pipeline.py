@@ -28,13 +28,15 @@ from nationwide.processing import (
     build_batch_tensor,
     check_elevation,
     check_gdaldem,
+    check_gdalbuildvrt,
     dedup_detections,
+    ensure_cached,
     infer_on_tensor,
-    process_tile,
+    process_tile_from_cache,
     reinit_session,
     run_inference,
 )
-from nationwide.spatial import load_url_csvs, query_stac_bbox, resolve_batch, resolve_tile_urls
+from nationwide.spatial import load_url_csvs, query_stac_bbox, resolve_batch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,9 +52,9 @@ def _safe_process(
     neighbor_bottom: tuple[str, str] | None = None,
     neighbor_corner: tuple[str, str] | None = None,
 ) -> tuple[str, list | Exception]:
-    """Process single tile, catching exceptions for graceful error handling"""
+    """Process single tile, catching exceptions for graceful error handling."""
     try:
-        return (coord, process_tile(
+        return (coord, process_tile_from_cache(
             coord, rgb_url, dsm_url,
             neighbor_right=neighbor_right,
             neighbor_bottom=neighbor_bottom,
@@ -62,53 +64,142 @@ def _safe_process(
         return (coord, exc)
 
 
+def _sort_tiles_by_row(
+    tiles: list[tuple],
+) -> list[tuple]:
+    """Sort tiles by grid row (ascending y, then ascending x).
+
+    Processing bottom-to-top ensures that when we process tile (x, y),
+    its bottom neighbor (x, y-1) and corner (x+1, y-1) from the previous
+    row are already in the tile cache.
+    """
+    def _key(entry: tuple) -> tuple[int, int]:
+        x, y = entry[0].split("-")
+        return (int(y), int(x))
+    return sorted(tiles, key=_key)
+
+
+def _group_by_row(tiles: list[tuple]) -> list[list[tuple]]:
+    """Group pre-sorted tiles into rows (same y coordinate)."""
+    if not tiles:
+        return []
+    rows: list[list[tuple]] = []
+    current_row: list[tuple] = [tiles[0]]
+    current_y = tiles[0][0].split("-")[1]
+    for entry in tiles[1:]:
+        y = entry[0].split("-")[1]
+        if y == current_y:
+            current_row.append(entry)
+        else:
+            rows.append(current_row)
+            current_row = [entry]
+            current_y = y
+    rows.append(current_row)
+    return rows
+
+
+def _predownload_row(
+    row_tiles: list[tuple],
+    url_lookup: dict[str, tuple[str, str]],
+    download_threads: int,
+) -> None:
+    """Pre-download all tiles in a row (+ their right neighbors) to the cache.
+
+    Bottom/corner neighbors are from the previous row (already cached).
+    Right neighbors are in the same row — we download them here too.
+    """
+    urls: list[str] = []
+    seen: set[str] = set()
+    for entry in row_tiles:
+        coord, rgb_url, dsm_url = entry[0], entry[1], entry[2]
+        for url in (rgb_url, dsm_url):
+            if url not in seen:
+                urls.append(url)
+                seen.add(url)
+        # Also pre-download right neighbor if known
+        parts = coord.split("-")
+        x, y = int(parts[0]), int(parts[1])
+        right_coord = f"{x+1}-{y}"
+        right_urls = url_lookup.get(right_coord)
+        if right_urls:
+            for url in right_urls:
+                if url not in seen:
+                    urls.append(url)
+                    seen.add(url)
+
+    from concurrent.futures import ThreadPoolExecutor
+    from nationwide.cache import cache_path as _cp
+
+    # Only download URLs not yet in cache
+    to_download = [u for u in urls if _cp(u) is None]
+    if not to_download:
+        return
+
+    def _dl(url: str) -> None:
+        try:
+            ensure_cached(url)
+        except Exception as exc:
+            log.warning(f"Pre-download failed: {url}: {exc}")
+
+    with ThreadPoolExecutor(max_workers=download_threads) as pool:
+        list(pool.map(_dl, to_download))
+
+
 def _producer_thread(
     tiles: list[tuple],
     tile_queue: queue.Queue,
     download_threads: int,
+    url_lookup: dict[str, tuple[str, str]] | None = None,
 ) -> None:
-    """Download+preprocess tiles in parallel processes, put results in queue.
+    """Row-ordered producer: pre-download each row, then process tiles.
 
-    Uses ProcessPoolExecutor for true CPU parallelism — avoids GIL
-    contention during rasterio TIFF decompression and numpy processing.
-    Each tile entry is (coord, rgb_url, dsm_url, neighbor_right, neighbor_bottom, neighbor_corner).
+    Tiles must be pre-sorted by _sort_tiles_by_row(). Processing bottom-
+    to-top ensures bottom/corner neighbors are cached from previous rows.
+    Right neighbors are pre-downloaded alongside the current row.
     """
     cc = get_cache_config()
-    base = (cc[0], cc[1]) if cc else (None, 0)
-    init_args = base
+    init_args = (cc[0], cc[1]) if cc else (None, 0)
+    rows = _group_by_row(tiles)
+    total = len(tiles)
 
-    pbar = tqdm(total=len(tiles), desc="Preprocessing", unit="tile", position=1, leave=False)
+    pbar = tqdm(total=total, desc="Preprocessing", unit="tile", position=1, leave=False)
 
     with ProcessPoolExecutor(
         max_workers=download_threads,
         initializer=reinit_session,
         initargs=init_args,
     ) as pool:
-        src = iter(tiles)
-        pending: dict[concurrent.futures.Future, bool] = {}
+        for row_tiles in rows:
+            # Phase 1: pre-download all tiles in this row to disk cache
+            if url_lookup is not None:
+                _predownload_row(row_tiles, url_lookup, download_threads)
 
-        for _ in range(download_threads):
-            try:
-                entry = next(src)
-                pending[pool.submit(_safe_process, *entry)] = True
-            except StopIteration:
-                break
+            # Phase 2: process tiles (reads from cache, no bytes in memory)
+            pending: dict[concurrent.futures.Future, bool] = {}
+            row_iter = iter(row_tiles)
 
-        while pending:
-            done, _ = concurrent.futures.wait(
-                pending, return_when=concurrent.futures.FIRST_COMPLETED,
-            )
-            future = done.pop()
-            del pending[future]
-            tile_queue.put(future.result())
-            pbar.update(1)
-            pbar.set_postfix(queued=tile_queue.qsize())
+            for _ in range(download_threads):
+                try:
+                    entry = next(row_iter)
+                    pending[pool.submit(_safe_process, *entry)] = True
+                except StopIteration:
+                    break
 
-            try:
-                entry = next(src)
-                pending[pool.submit(_safe_process, *entry)] = True
-            except StopIteration:
-                pass
+            while pending:
+                done, _ = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                future = done.pop()
+                del pending[future]
+                tile_queue.put(future.result())
+                pbar.update(1)
+                pbar.set_postfix(queued=tile_queue.qsize())
+
+                try:
+                    entry = next(row_iter)
+                    pending[pool.submit(_safe_process, *entry)] = True
+                except StopIteration:
+                    pass
 
     pbar.close()
     tile_queue.put(None)  # Sentinel
@@ -304,22 +395,12 @@ def run_pipeline(
     # All resolved tiles (including elevation-filtered ones) can serve as neighbors
     url_lookup: dict[str, tuple[str, str]] = {c: (r, d) for c, r, d in tile_source}
 
-    def _resolve_neighbor(coord: str) -> tuple[str, str] | None:
-        """Look up neighbor URLs, falling back to HEAD scan if outside bbox."""
-        cached = url_lookup.get(coord)
-        if cached is not None:
-            return cached
-        pair = resolve_tile_urls(coord)
-        if pair is not None:
-            url_lookup[coord] = pair
-        return pair
-
     # Load cached neighbor URLs, then resolve any remaining via HEAD scan
     cached_neighbors = load_neighbor_cache()
     url_lookup.update(cached_neighbors)
 
     neighbor_coords: set[str] = set()
-    for c, _, _ in remaining:
+    for c, _, _ in tile_source:
         parts = c.split("-")
         x, y = int(parts[0]), int(parts[1])
         for nc in [f"{x+1}-{y}", f"{x}-{y-1}", f"{x+1}-{y-1}"]:
@@ -344,15 +425,15 @@ def run_pipeline(
         corner = url_lookup.get(f"{x+1}-{y-1}")
         return right, bottom, corner
 
-    tiles_with_neighbors = [
+    tiles_with_neighbors = _sort_tiles_by_row([
         (c, r, d, *_neighbor_urls(c)) for c, r, d in remaining
-    ]
+    ])
 
     tile_queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
 
     producer = threading.Thread(
         target=_producer_thread,
-        args=(tiles_with_neighbors, tile_queue, download_threads),
+        args=(tiles_with_neighbors, tile_queue, download_threads, url_lookup),
         daemon=True,
     )
     producer.start()
@@ -520,6 +601,39 @@ app = typer.Typer(help="Large-scale rock detection on Swisstopo imagery.")
 
 
 @app.command()
+def export_tiles(
+    bbox: Optional[str] = typer.Option(None, help="WGS84 bounding box: west,south,east,north"),
+    all_switzerland: bool = typer.Option(False, "--all", help="Export all of Switzerland"),
+    coords: Optional[list[str]] = typer.Option(None, help="Tile coordinates (e.g. 2587-1133)"),
+    cache_dir: Path = typer.Option(Path("data/tile_cache"), help="Cache directory (for STAC cache)"),
+    download_threads: int = typer.Option(8, help="Thread count for URL resolution"),
+    rgb_year: int = typer.Option(0, "--rgb-year", help="SwissIMAGE year (0=newest)"),
+    dsm_year: int = typer.Option(0, "--dsm-year", help="swissALTI3D year (0=newest)"),
+) -> None:
+    """Export tile list as CSV for the Rust preprocessor (coord,rgb_url,dsm_url)."""
+    set_stac_cache_dir(cache_dir)
+
+    if all_switzerland:
+        bbox = SWITZERLAND_BBOX
+        tile_list = query_stac_bbox(bbox, rgb_year=rgb_year, dsm_year=dsm_year)
+    elif bbox:
+        tile_list = query_stac_bbox(bbox, rgb_year=rgb_year, dsm_year=dsm_year)
+    elif coords:
+        url_map = resolve_batch(list(coords), threads=download_threads)
+        tile_list = [(c, r, d) for c, (r, d) in url_map.items()]
+    else:
+        log.error("Pass --coords, --bbox, or --all.")
+        raise typer.Exit(code=1)
+
+    for coord, rgb_url, dsm_url in tile_list:
+        print(f"{coord},{rgb_url},{dsm_url}")
+
+    log.info(f"Exported {len(tile_list)} tiles")
+
+
+
+
+@app.command()
 def run(
     ctx: typer.Context,
     model: Optional[Path] = typer.Option(None, help="Path to YOLO .pt model"),
@@ -549,6 +663,7 @@ def run(
         print(ctx.get_help())
         raise typer.Exit()
     check_gdaldem()
+    check_gdalbuildvrt()
     init_cache(cache_dir, cache_gb)
     set_stac_cache_dir(cache_dir)
 

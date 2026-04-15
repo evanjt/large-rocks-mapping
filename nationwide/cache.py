@@ -44,6 +44,17 @@ class TileCache:
             path.write_bytes(data)
         self._evict_if_needed()
 
+    def path(self, url: str) -> Path | None:
+        """Return filesystem path to cached file without reading it."""
+        p = self._dir / self._key(url)
+        try:
+            if p.exists() and p.stat().st_size > 0:
+                p.touch()
+                return p
+        except OSError:
+            pass
+        return None
+
     def _evict_if_needed(self) -> None:
         with self._lock:
             files = []
@@ -98,6 +109,13 @@ def reinit_cache(cache_dir: str | None, max_bytes: int) -> None:
         _tile_cache = TileCache(Path(cache_dir), max_bytes)
     else:
         _tile_cache = None
+
+
+def cache_path(url: str) -> Path | None:
+    """Return filesystem path to cached file without reading bytes."""
+    if _tile_cache is None:
+        return None
+    return _tile_cache.path(url)
 
 
 def cache_get(url: str) -> bytes | None:
