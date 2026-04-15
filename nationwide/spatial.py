@@ -1,5 +1,6 @@
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Iterator
 import requests
 from tqdm import tqdm
@@ -159,3 +160,29 @@ def query_stac_bbox(
     if cache_key:
         save_stac_cache(cache_key, result)
     return result
+
+
+def load_url_csvs(
+    rgb_csv: Path, dsm_csv: Path,
+) -> list[tuple[str, str, str]]:
+    """Load paired tile URLs from two CSV files (one URL per line).
+
+    Matches the format used in rock_detection/preprocess/urls/*.csv.
+    Extracts XXXX-YYYY coordinates from each URL and inner-joins on them.
+    """
+    def _parse_csv(path: Path) -> dict[str, str]:
+        urls: dict[str, str] = {}
+        for line in path.read_text().strip().splitlines():
+            url = line.strip()
+            if not url:
+                continue
+            m = COORD_RE.search(url)
+            if m:
+                urls[m.group(1)] = url
+        return urls
+
+    rgb_urls = _parse_csv(rgb_csv)
+    dsm_urls = _parse_csv(dsm_csv)
+    common = sorted(set(rgb_urls) & set(dsm_urls))
+    log.info(f"Loaded {len(rgb_urls)} RGB + {len(dsm_urls)} DSM URLs, {len(common)} matched pairs")
+    return [(c, rgb_urls[c], dsm_urls[c]) for c in common]

@@ -38,6 +38,7 @@ wandb
 *.duckdb
 *.pt
 *.gpkg
+*.wal
 
 models/
 validation/

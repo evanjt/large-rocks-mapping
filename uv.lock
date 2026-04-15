@@ -1323,7 +1323,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'rocm'", specifier = ">=0.15", index = "https://download.pytorch.org/whl/rocm6.3", conflict = { package = "rock-detection", extra = "rocm" } },
     { name = "tqdm", specifier = ">=4.66" },
     { name = "typer", specifier = ">=0.12" },
-    { name = "ultralytics", specifier = ">=8.3,<8.4" },
+    { name = "ultralytics", specifier = "==8.4.36" },
 ]
 provides-extras = ["cuda", "rocm", "dev"]
 
@@ -1782,7 +1782,7 @@ wheels = [
 
 [[package]]
 name = "ultralytics"
-version = "8.3.253"
+version = "8.4.36"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "matplotlib" },
@@ -1803,9 +1803,9 @@ dependencies = [
     { name = "torchvision", version = "0.24.1+rocm6.3", source = { registry = "https://download.pytorch.org/whl/rocm6.3" }, marker = "extra == 'extra-14-rock-detection-rocm'" },
     { name = "ultralytics-thop" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/89/ef/94a1170f5019686e45a1949a45ff61f9bdf1e844c6062183d9b2d2fd36e6/ultralytics-8.3.253.tar.gz", hash = "sha256:3d0c01a46550d4171c89c09ba6172649f718cb33e74d2679106555bcc0a18a54", size = 993252, upload-time = "2026-01-13T12:48:39.742Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/58/55/431fc69618281f8c8568f2d635bb0f42593f0134bedf2a6a4e631eadabee/ultralytics-8.4.36.tar.gz", hash = "sha256:cd973a7bdd9e427379e0f14240e34d9ff34db8f277189ac53385a376d1da3656", size = 1032735, upload-time = "2026-04-08T16:55:35.806Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/33/3d/2ddb40760bd9590e5c5e8a1887edfcbeb59081866c6f336bba610067c9c2/ultralytics-8.3.253-py3-none-any.whl", hash = "sha256:c2ad53388ce00e0587a21745a9c5ab1bdcb4169b74545488fab3fd1b25fe86f2", size = 1157465, upload-time = "2026-01-13T12:48:35.603Z" },
+    { url = "https://files.pythonhosted.org/packages/55/bc/34b54f39068953449e3dbd0a94751a39fb71a6ca067b28912aa9260d735c/ultralytics-8.4.36-py3-none-any.whl", hash = "sha256:d814f238ec6367569a0312d7b6706d438e943dfa86721054bba90308840a315d", size = 1223688, upload-time = "2026-04-08T16:55:31.891Z" },
 ]
 
 [[package]]

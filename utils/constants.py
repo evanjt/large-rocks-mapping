@@ -32,6 +32,8 @@ STRIDE_PX = TILE_SIZE_PX - OVERLAP_PX                   # 430px
 STRIDE_GROUND_M = STRIDE_PX * TARGET_RES                # 215m
 SRC_CROP_DSM = int(TILE_GROUND_M / DSM_RES)             # 640px
 SRC_STRIDE_DSM = int(STRIDE_GROUND_M / DSM_RES)         # 430px
+SRC_CROP_RGB = int(TILE_GROUND_M / SWISSIMAGE_RES)      # 3200px at 10cm
+SRC_STRIDE_RGB = int(STRIDE_GROUND_M / SWISSIMAGE_RES)  # 2150px at 10cm
 
 # Swisstopo CDN URL templates (year + coord are filled at runtime)
 SI_TEMPLATE = (
