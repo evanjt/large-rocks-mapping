@@ -402,43 +402,80 @@ def process_tile(
     rgb_bottom = downloaded.get("rgb_bottom")
     rgb_corner = downloaded.get("rgb_corner")
 
-    # Get tile bounds from center DSM for tile_id
-    with rasterio.io.MemoryFile(dsm_bytes) as mf:
-        with mf.open() as src:
+    has_neighbors = dsm_right or dsm_bottom or dsm_corner
+
+    # --- Center tile: write original bytes directly (preserves file structure) ---
+    fd_dsm, dsm_center_path = tempfile.mkstemp(suffix=".tif")
+    os.close(fd_dsm)
+    with open(dsm_center_path, "wb") as f:
+        f.write(dsm_bytes)
+
+    fd_rgb, rgb_center_path = tempfile.mkstemp(suffix=".tif")
+    os.close(fd_rgb)
+    with open(rgb_center_path, "wb") as f:
+        f.write(rgb_bytes)
+
+    try:
+        with rasterio.open(dsm_center_path) as src:
+            dsm_transform = src.transform
             dsm_bounds = src.bounds
 
-    # Stitch DSM + generate hillshade on extended raster
-    dsm_path, dsm_transform = _stitch_and_write(
-        dsm_bytes, 1, dsm_right, dsm_bottom, dsm_corner,
-        TILE_PX_DSM, NEIGHBOR_STRIP_DSM,
-    )
-    del dsm_bytes, dsm_right, dsm_bottom, dsm_corner
+        # Center 4×4 hillshade: from original DSM (no stitching artifacts)
+        center_hillshade = generate_hillshade(dsm_center_path)
+        hs_patches = crop_patches(
+            center_hillshade, dsm_transform,
+            crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM, out_px=TILE_SIZE_PX,
+        )
+        del center_hillshade
 
-    try:
-        hillshade = generate_hillshade(dsm_path)
-    finally:
-        Path(dsm_path).unlink(missing_ok=True)
-
-    hs_h, hs_w = hillshade.shape
-    hs_patches = crop_patches(
-        hillshade, dsm_transform,
-        crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM, out_px=TILE_SIZE_PX,
-    )
-    del hillshade
-
-    # Stitch RGB + extract patches
-    rgb_path, _ = _stitch_and_write(
-        rgb_bytes, 3, rgb_right, rgb_bottom, rgb_corner,
-        TILE_PX_RGB, NEIGHBOR_STRIP_RGB,
-    )
-    del rgb_bytes, rgb_right, rgb_bottom, rgb_corner
-
-    try:
-        with rasterio.open(rgb_path) as src:
+        # Center 4×4 RGB: from original file (preserves compression/block layout)
+        with rasterio.open(rgb_center_path) as src:
             rgb_width, rgb_height = src.width, src.height
-        rgb_patches = _crop_resample_rgb(rgb_path, rgb_width, rgb_height)
+        rgb_patches = _crop_resample_rgb(
+            rgb_center_path, rgb_width, rgb_height,
+        )
+
+        # --- Cross-boundary patches (5th row/col): from stitched rasters ---
+        if has_neighbors:
+            dsm_ext_path, dsm_ext_tf = _stitch_and_write(
+                dsm_bytes, 1, dsm_right, dsm_bottom, dsm_corner,
+                TILE_PX_DSM, NEIGHBOR_STRIP_DSM,
+            )
+            try:
+                ext_hillshade = generate_hillshade(dsm_ext_path)
+                ext_hs_patches = crop_patches(
+                    ext_hillshade, dsm_ext_tf,
+                    crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM,
+                    out_px=TILE_SIZE_PX,
+                )
+                del ext_hillshade
+                # Keep only patches beyond the 4×4 center grid
+                hs_patches.extend(
+                    p for p in ext_hs_patches if p[2] >= 4 or p[3] >= 4
+                )
+            finally:
+                Path(dsm_ext_path).unlink(missing_ok=True)
+
+            rgb_ext_path, _ = _stitch_and_write(
+                rgb_bytes, 3, rgb_right, rgb_bottom, rgb_corner,
+                TILE_PX_RGB, NEIGHBOR_STRIP_RGB,
+            )
+            try:
+                with rasterio.open(rgb_ext_path) as src:
+                    ext_w, ext_h = src.width, src.height
+                ext_rgb_patches = _crop_resample_rgb(rgb_ext_path, ext_w, ext_h)
+                rgb_patches.extend(
+                    p for p in ext_rgb_patches if p[2] >= 4 or p[3] >= 4
+                )
+            finally:
+                Path(rgb_ext_path).unlink(missing_ok=True)
+
     finally:
-        Path(rgb_path).unlink(missing_ok=True)
+        Path(dsm_center_path).unlink(missing_ok=True)
+        Path(rgb_center_path).unlink(missing_ok=True)
+
+    del dsm_bytes, dsm_right, dsm_bottom, dsm_corner
+    del rgb_bytes, rgb_right, rgb_bottom, rgb_corner
 
     # LV95 km grid
     grid_x = int(dsm_bounds.left) // 1000
