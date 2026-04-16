@@ -1,9 +1,11 @@
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+
 import duckdb
 
 log = logging.getLogger(__name__)
+
 
 _DB_SCHEMA_DETECTIONS = """
 CREATE TABLE IF NOT EXISTS detections (
@@ -25,15 +27,8 @@ _DB_SCHEMA_CHECKPOINTS = """
 CREATE TABLE IF NOT EXISTS processed_tiles (
     tile_id       VARCHAR PRIMARY KEY,
     n_detections  INTEGER,
+    skip_reason   VARCHAR,
     processed_at  TIMESTAMP DEFAULT current_timestamp
-);
-"""
-
-_DB_SCHEMA_ELEVATIONS = """
-CREATE TABLE IF NOT EXISTS tile_elevations (
-    coord        VARCHAR PRIMARY KEY,
-    max_elev     FLOAT,
-    checked_at   TIMESTAMP DEFAULT current_timestamp
 );
 """
 
@@ -54,54 +49,42 @@ class Detection:
 
 
 def init_db(db_path: str | Path) -> duckdb.DuckDBPyConnection:
-    """Create or open the detections database and ensure schema exists."""
+    """Open or create the detections DB and ensure schema exists."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(db_path))
     con.execute(_DB_SCHEMA_DETECTIONS)
     con.execute(_DB_SCHEMA_CHECKPOINTS)
-    con.execute(_DB_SCHEMA_ELEVATIONS)
     return con
 
 
 def get_processed_tiles(con: duckdb.DuckDBPyConnection) -> set[str]:
-    """Return set of tile_ids that have already been processed."""
+    """Return set of tile_ids already processed (or recorded as skipped)."""
     rows = con.execute("SELECT tile_id FROM processed_tiles").fetchall()
     return {r[0] for r in rows}
 
 
 def mark_tile_done(
-    con: duckdb.DuckDBPyConnection, tile_id: str, n_detections: int,
+    con: duckdb.DuckDBPyConnection,
+    tile_id: str,
+    n_detections: int,
+    skip_reason: str | None = None,
 ) -> None:
-    """Record a tile as processed in the checkpoint table."""
+    """Record a tile's outcome in the checkpoint table."""
     con.execute(
-        "INSERT INTO processed_tiles (tile_id, n_detections) VALUES (?, ?) "
+        "INSERT INTO processed_tiles (tile_id, n_detections, skip_reason) "
+        "VALUES (?, ?, ?) "
         "ON CONFLICT (tile_id) DO UPDATE SET "
-        "n_detections = excluded.n_detections, processed_at = NOW()",
-        [tile_id, n_detections],
-    )
-
-
-def get_cached_elevations(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
-    """Return {coord: max_elevation} for all cached tiles."""
-    rows = con.execute("SELECT coord, max_elev FROM tile_elevations").fetchall()
-    return {r[0]: r[1] for r in rows}
-
-
-def save_elevation(
-    con: duckdb.DuckDBPyConnection, coord: str, max_elev: float,
-) -> None:
-    """Cache a tile's max elevation."""
-    con.execute(
-        "INSERT INTO tile_elevations (coord, max_elev) VALUES (?, ?) "
-        "ON CONFLICT (coord) DO UPDATE SET max_elev = excluded.max_elev",
-        [coord, max_elev],
+        "n_detections = excluded.n_detections, "
+        "skip_reason = excluded.skip_reason, "
+        "processed_at = NOW()",
+        [tile_id, n_detections, skip_reason],
     )
 
 
 def write_detections(
     con: duckdb.DuckDBPyConnection, detections: list[Detection],
 ) -> int:
-    """Bulk-insert detections using executemany. Returns row count."""
+    """Bulk-insert detections; returns the row count."""
     if not detections:
         return 0
     rows = [

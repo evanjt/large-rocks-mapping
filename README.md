@@ -133,55 +133,32 @@ Applies the trained model to Swisstopo tiles at national scale. Requires Python 
     # Full option reference
     uv run large-rocks-mapping run --help
 
-Without a pre-built cache, `run` streams the full pipeline per tile: download RGB+DSM from Swisstopo, generate hillshade, crop/resample patches, fuse, run YOLO inference, write to DuckDB. Processed tiles are checkpointed — re-running the same output file skips completed tiles.
+`run` streams the full pipeline per tile: download RGB+DSM from Swisstopo, generate hillshade, build a VRT stitched with neighbour tiles, cut 5×5 = 25 patches (covering the 35 m edge strip so no rock stripes are systematically missed), fuse the green channel with hillshade, run the model, dedup in EPSG:2056, write to DuckDB. Processed tiles are checkpointed — re-running the same output file skips completed tiles.
 
-## Fill cache (optional, no GPU needed)
+## Cache
 
-    uv run large-rocks-mapping fill-cache --all --cache-dir /ssd4tb/eceo-rock-data
-
-Pre-fills the patch cache overnight or while the GPU is busy. Uses the same processing as `run` — next `run` with the same `--cache-dir` will load cached patches and skip preprocessing.
-
-## Cache architecture
-
-The cache directory uses a two-tier layout:
-
-    data/tile_cache/
-    ├── downloads/    # Raw .tif + hillshade .npy — LRU evicted per --cache-gb
-    ├── patches/      # Fused .patchbin files — never evicted
-    └── stac_cache.duckdb
-
-**Downloads** (raw tiles, hillshade intermediates) are subject to LRU eviction controlled by `--cache-gb`. **Patches** (the expensive output of preprocessing) are stored separately and never evicted — cached patches persist across runs regardless of cache budget.
+Downloads go to `--cache-dir` (default `data/tile_cache/`) and are LRU-evicted when the directory exceeds `--cache-gb`. A separate `stac_cache.duckdb` in the same directory caches STAC bbox queries so repeated runs over the same bounding box don't re-hit the STAC API.
 
 ## `run` options
 
 | Option | Default | Description |
 |---|---|---|
-| `--model` | | YOLO `.pt` weights path |
+| `--model` | | Model `.pt` weights path |
 | `--output` | `detections.duckdb` | DuckDB output path |
 | `--coords` | | Tile coordinate(s), repeatable (e.g. `2587-1133`) |
 | `--bbox` | | WGS84 bounding box (`west,south,east,north`) |
 | `--all` | `false` | Process all of Switzerland |
-| `--min-elevation` | `1500` | Skip tiles below this elevation in meters, 0 to disable |
-| `--device` | `auto` | PyTorch device (auto, cuda:0, cpu, etc.) |
-| `--download-threads` | `8` | Parallel download workers |
+| `--rgb-urls` / `--dsm-urls` | | Paired CSVs of explicit tile URLs (one URL per line) |
+| `--min-elevation` | `1500` | Skip tiles below this elevation in metres, 0 to disable |
+| `--device` | `auto` | PyTorch device (auto, cuda:0, cpu) |
+| `--workers` | `min(12, cpu)` | Preprocessing workers (`0` = auto) |
 | `--conf` | `0.10` | Confidence threshold |
 | `--iou` | `0.70` | IoU threshold |
-| `--no-dedup` | `false` | Disable 7.5m spatial deduplication |
-| `--rgb-year` | `0` | SwissIMAGE year (0 = newest available) |
-| `--dsm-year` | `0` | swissALTI3D year (0 = newest available) |
-| `--rgb-urls` | | CSV of SwissIMAGE URLs (one per line) |
-| `--dsm-urls` | | CSV of swissALTI3D URLs (one per line) |
-| `--cache-dir` | `data/tile_cache` | Tile cache directory |
-| `--cache-gb` | `500` | Max download cache in GB (patches are unlimited) |
-| `--max-batch-tiles` | `16` | Tiles per GPU batch |
+| `--no-dedup` | `false` | Disable 7.5 m spatial deduplication |
+| `--cache-dir` | `data/tile_cache` | Download + STAC cache directory |
+| `--cache-gb` | `500` | Max download cache size in GB (0 disables) |
+| `--max-batch-tiles` | `16` | Tiles per GPU batch (25 patches each) |
 
-## `fill-cache` options
+## Using a different model
 
-Same tile-source options as `run` (`--coords`, `--bbox`, `--all`, `--rgb-urls`, `--dsm-urls`), plus:
-
-| Option | Default | Description |
-|---|---|---|
-| `--cache-dir` | `data/tile_cache` | Cache directory (must match `run`) |
-| `--cache-gb` | `500` | Max download cache in GB (patches are unlimited) |
-| `--workers` | `12` | Parallel preprocessing workers |
-| `--min-elevation` | `1500` | Skip tiles below this elevation |
+All torch / ultralytics code lives in `nationwide/detector.py`. To apply a different model family, replace that one file with a class named `Detector` exposing `__init__(model_path, device, conf, iou, imgsz)`, `warmup()`, and `detect(patches) -> list[Detection]`. Everything else — downloads, tiling, hillshade, patch generation, dedup, storage — is model-agnostic.
