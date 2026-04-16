@@ -77,11 +77,18 @@ def _stac_paginate(
     """Yield all STAC items from a collection within a bbox, w pagination."""
     url: str | None = f"{STAC_BASE}/collections/{collection}/items"
     params: dict = {"bbox": bbox, "limit": limit}
+    page = 0
+    total_items = 0
     while url:
+        page += 1
         resp = _SESSION.get(url, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        yield from data.get("features", [])
+        features = data.get("features", [])
+        total_items += len(features)
+        if page % 10 == 0 or page == 1:
+            log.info(f"  STAC page {page}: {total_items} items so far ...")
+        yield from features
         url = None
         params = {}
         for link in data.get("links", []):

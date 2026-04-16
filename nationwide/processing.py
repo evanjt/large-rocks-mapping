@@ -1,6 +1,7 @@
 import logging
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import time
@@ -15,12 +16,12 @@ import requests
 from requests.adapters import HTTPAdapter
 from rasterio.enums import Resampling
 from rasterio.windows import Window
-from nationwide.cache import cache_get, cache_path, cache_put, reinit_cache
+from nationwide.cache import cache_get, cache_path, cache_put, patch_get, patch_put, reinit_cache
 from nationwide.db import Detection
 from utils.constants import (
-    FUSION_CHANNEL, NEIGHBOR_STRIP_DSM,
+    FUSION_CHANNEL, NEIGHBOR_STRIP_DSM, NEIGHBOR_STRIP_RGB,
     SRC_CROP_DSM, SRC_CROP_RGB,
-    SRC_STRIDE_DSM, SRC_STRIDE_RGB, TILE_PX_DSM,
+    SRC_STRIDE_DSM, SRC_STRIDE_RGB, TILE_PX_DSM, TILE_PX_RGB,
     TILE_SIZE_PX,
 )
 
@@ -116,26 +117,6 @@ def generate_hillshade(dsm_path: str | Path) -> np.ndarray:
     finally:
         Path(out_path).unlink(missing_ok=True)
 
-
-def _get_hillshade_from_path(
-    dsm_path: Path, dsm_url: str,
-) -> tuple[np.ndarray, rasterio.Affine]:
-    """Generate hillshade from a cached DSM file. No temp-file copy needed."""
-    hs_cache_key = dsm_url.replace(".tif", "_hs.npy")
-    cached = cache_get(hs_cache_key)
-
-    with rasterio.open(str(dsm_path)) as src:
-        transform = src.transform
-
-    if cached is not None:
-        hillshade = np.frombuffer(cached, dtype=np.uint8).reshape(
-            TILE_PX_DSM, TILE_PX_DSM,
-        )
-        return hillshade, transform
-
-    hillshade = generate_hillshade(str(dsm_path))
-    cache_put(hs_cache_key, hillshade.tobytes())
-    return hillshade, transform
 
 
 def _build_vrt(paths: list[str | Path]) -> str:
@@ -343,50 +324,54 @@ def _patch_cache_key(coord: str, has_neighbors: bool) -> str:
     """Cache key for fused patches. Includes neighbor flag so cached
     patches with/without stitching don't collide."""
     suffix = "_stitched" if has_neighbors else ""
-    return f"patches_{coord}{suffix}.npz"
+    return f"patches_{coord}{suffix}.patchbin"
+
+
+# Size of one patch's pixel data: 3 channels × 640 × 640 pixels × uint8
+_PATCH_PIXEL_BYTES = 3 * TILE_SIZE_PX * TILE_SIZE_PX
 
 
 def _save_patch_cache(key: str, results: list[tuple]) -> None:
-    """Save fused patches + transforms to tile cache."""
-    arrays = []
-    transforms = []
-    rows_cols = []
+    """Save fused patches + transforms to the patch store (never evicted).
+
+    Uses a flat binary format for fast loading:
+      uint32 n_patches
+      per patch: float64[4] transform + int32[2] row_col + uint8[3*640*640] pixels
+    """
+    n = len(results)
+    parts = [struct.pack("<I", n)]
     for patch, tf, row, col, *_ in results:
-        arrays.append(patch)
-        transforms.append((tf.a, tf.c, tf.e, tf.f))
-        rows_cols.append((row, col))
-    from nationwide.cache import cache_put
-    import io
-    buf = io.BytesIO()
-    np.savez_compressed(
-        buf,
-        patches=np.stack(arrays),
-        transforms=np.array(transforms),
-        rows_cols=np.array(rows_cols),
-    )
-    cache_put(key, buf.getvalue())
+        parts.append(np.array([tf.a, tf.c, tf.e, tf.f], dtype=np.float64).tobytes())
+        parts.append(np.array([row, col], dtype=np.int32).tobytes())
+        parts.append(np.ascontiguousarray(patch).tobytes())
+    patch_put(key, b"".join(parts))
 
 
 def _load_patch_cache(
     key: str, tile_id: str, rgb_url: str, dsm_url: str,
 ) -> list[tuple] | None:
-    """Load cached fused patches. Returns None on miss."""
-    from nationwide.cache import cache_get
-    data = cache_get(key)
+    """Load cached fused patches (.patchbin). Returns None on miss."""
+    data = patch_get(key)
     if data is None:
         return None
     try:
-        import io
-        npz = np.load(io.BytesIO(data))
-        patches = npz["patches"]
-        transforms = npz["transforms"]
-        rows_cols = npz["rows_cols"]
+        off = 0
+        n = struct.unpack_from("<I", data, off)[0]
+        off += 4
         results = []
-        for i in range(len(patches)):
-            a, c, e, f = transforms[i]
-            tf = rasterio.Affine(a, 0, c, 0, e, f)
-            row, col = int(rows_cols[i][0]), int(rows_cols[i][1])
-            results.append((patches[i], tf, row, col, tile_id, rgb_url, dsm_url))
+        for _ in range(n):
+            tf_vals = np.frombuffer(data, dtype=np.float64, count=4, offset=off)
+            a, c, e, f = tf_vals
+            off += 32
+            rc = np.frombuffer(data, dtype=np.int32, count=2, offset=off)
+            row, col = int(rc[0]), int(rc[1])
+            off += 8
+            patch = np.frombuffer(
+                data, dtype=np.uint8, count=_PATCH_PIXEL_BYTES, offset=off,
+            ).reshape(3, TILE_SIZE_PX, TILE_SIZE_PX).copy()
+            off += _PATCH_PIXEL_BYTES
+            tf = rasterio.Affine(float(a), 0, float(c), 0, float(e), float(f))
+            results.append((patch, tf, row, col, tile_id, rgb_url, dsm_url))
         return results
     except Exception:
         return None
@@ -399,6 +384,7 @@ def process_tile_from_cache(
     neighbor_right: tuple[str, str] | None = None,
     neighbor_bottom: tuple[str, str] | None = None,
     neighbor_corner: tuple[str, str] | None = None,
+    cache_patches: bool = True,
 ) -> list[tuple[np.ndarray, rasterio.Affine, int, int, str, str, str]]:
     """Process a tile using cached files on disk. Memory-efficient.
 
@@ -410,7 +396,7 @@ def process_tile_from_cache(
     has_neighbors = bool(neighbor_right or neighbor_bottom or neighbor_corner)
     tile_id = coord.replace("-", "_")
 
-    # --- Check patch cache ---
+    # --- Check patch cache (always read, only write if cache_patches=True) ---
     cache_key = _patch_cache_key(coord, has_neighbors)
     cached = _load_patch_cache(cache_key, tile_id, rgb_url, dsm_url)
     if cached is not None:
@@ -429,83 +415,49 @@ def process_tile_from_cache(
         if nb is None:
             continue
         nb_rgb, nb_dsm = nb
-        rp = cache_path(nb_rgb)
-        dp = cache_path(nb_dsm)
-        if rp and dp:
-            nb_rgb_paths[name] = rp
-            nb_dsm_paths[name] = dp
-            nb_dsm_urls[name] = nb_dsm
+        try:
+            rp = ensure_cached(nb_rgb)
+            dp = ensure_cached(nb_dsm)
+        except Exception:
+            continue
+        nb_rgb_paths[name] = rp
+        nb_dsm_paths[name] = dp
+        nb_dsm_urls[name] = nb_dsm
 
     actual_neighbors = bool(nb_rgb_paths)
 
-    # --- Generate hillshades in parallel (from cached DSM files) ---
-    hs_jobs: dict[str, tuple[Path, str]] = {"center": (dsm_center_path, dsm_url)}
-    for name in nb_dsm_paths:
-        hs_jobs[name] = (nb_dsm_paths[name], nb_dsm_urls[name])
+    # --- Build VRT of all tiles (center + neighbors) ---
+    dsm_paths = [dsm_center_path] + [nb_dsm_paths[n] for n in ["right", "bottom", "corner"] if n in nb_dsm_paths]
+    rgb_paths = [rgb_center_path] + [nb_rgb_paths[n] for n in ["right", "bottom", "corner"] if n in nb_rgb_paths]
 
-    with ThreadPoolExecutor(max_workers=len(hs_jobs)) as pool:
-        hs_futures = {
-            name: pool.submit(_get_hillshade_from_path, path, url)
-            for name, (path, url) in hs_jobs.items()
-        }
-        hs_results = {name: f.result() for name, f in hs_futures.items()}
+    dsm_vrt = _build_vrt(dsm_paths) if actual_neighbors else str(dsm_center_path)
+    rgb_vrt = _build_vrt(rgb_paths) if actual_neighbors else str(rgb_center_path)
 
-    center_hs, dsm_transform = hs_results["center"]
+    try:
+        # Hillshade on the joined DSM (correct gradients at tile boundaries)
+        hillshade = generate_hillshade(dsm_vrt)
+        with rasterio.open(dsm_vrt) as src:
+            dsm_transform = src.transform
 
-    # --- Center 4×4 hillshade patches (pure slice, no resize) ---
-    hs_patches = crop_patches(
-        center_hs, dsm_transform,
-        crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM, out_px=TILE_SIZE_PX,
-    )
+        # Crop to center + neighbor strip
+        hs_h = TILE_PX_DSM + (NEIGHBOR_STRIP_DSM if "bottom" in nb_dsm_paths else 0)
+        hs_w = TILE_PX_DSM + (NEIGHBOR_STRIP_DSM if "right" in nb_dsm_paths else 0)
+        hillshade = hillshade[:hs_h, :hs_w]
 
-    # --- Edge hillshade patches (stitch numpy arrays — cheap, ~6MB) ---
-    if actual_neighbors:
-        right_hs = hs_results.get("right", (None,))[0]
-        bottom_hs = hs_results.get("bottom", (None,))[0]
-        corner_hs = hs_results.get("corner", (None,))[0]
-
-        ext_h = TILE_PX_DSM + (NEIGHBOR_STRIP_DSM if bottom_hs is not None else 0)
-        ext_w = TILE_PX_DSM + (NEIGHBOR_STRIP_DSM if right_hs is not None else 0)
-        extended_hs = np.zeros((ext_h, ext_w), dtype=center_hs.dtype)
-        extended_hs[:TILE_PX_DSM, :TILE_PX_DSM] = center_hs
-        if right_hs is not None:
-            extended_hs[:TILE_PX_DSM, TILE_PX_DSM:] = right_hs[:, :NEIGHBOR_STRIP_DSM]
-        if bottom_hs is not None:
-            extended_hs[TILE_PX_DSM:, :TILE_PX_DSM] = bottom_hs[:NEIGHBOR_STRIP_DSM, :]
-        if corner_hs is not None and right_hs is not None and bottom_hs is not None:
-            extended_hs[TILE_PX_DSM:, TILE_PX_DSM:] = corner_hs[:NEIGHBOR_STRIP_DSM, :NEIGHBOR_STRIP_DSM]
-
-        ext_hs_patches = crop_patches(
-            extended_hs, dsm_transform,
+        hs_patches = crop_patches(
+            hillshade, dsm_transform,
             crop_px=SRC_CROP_DSM, stride_px=SRC_STRIDE_DSM, out_px=TILE_SIZE_PX,
         )
-        hs_patches.extend(p for p in ext_hs_patches if p[2] >= 4 or p[3] >= 4)
-        del extended_hs
+        del hillshade
 
-    del center_hs
-
-    # --- Center 4×4 RGB patches (windowed reads from cached file) ---
-    with rasterio.open(str(rgb_center_path)) as src:
-        rgb_width, rgb_height = src.width, src.height
-    rgb_patches = _crop_resample_rgb(str(rgb_center_path), rgb_width, rgb_height)
-
-    # --- Edge RGB patches via VRT (zero-copy mosaic of cached files) ---
-    if actual_neighbors:
-        vrt_paths_list: list[Path] = [rgb_center_path]
-        for name in ["right", "bottom", "corner"]:
-            if name in nb_rgb_paths:
-                vrt_paths_list.append(nb_rgb_paths[name])
-
-        vrt_path = _build_vrt(vrt_paths_list)
-        try:
-            with rasterio.open(vrt_path) as src:
-                vrt_w, vrt_h = src.width, src.height
-            ext_rgb_patches = _crop_resample_rgb(vrt_path, vrt_w, vrt_h)
-            rgb_patches.extend(
-                p for p in ext_rgb_patches if p[2] >= 4 or p[3] >= 4
-            )
-        finally:
-            Path(vrt_path).unlink(missing_ok=True)
+        # RGB patches from VRT, clipped to matching extent
+        rgb_w = TILE_PX_RGB + (NEIGHBOR_STRIP_RGB if "right" in nb_rgb_paths else 0)
+        rgb_h = TILE_PX_RGB + (NEIGHBOR_STRIP_RGB if "bottom" in nb_rgb_paths else 0)
+        rgb_patches = _crop_resample_rgb(rgb_vrt, rgb_w, rgb_h)
+    finally:
+        if actual_neighbors:
+            Path(dsm_vrt).unlink(missing_ok=True)
+            Path(rgb_vrt).unlink(missing_ok=True)
 
     # --- Fuse RGB + hillshade ---
     results = []
@@ -515,12 +467,9 @@ def process_tile_from_cache(
         rgb_patch[FUSION_CHANNEL] = hs_patch
         results.append((rgb_patch, hs_tf, row, col, tile_id, rgb_url, dsm_url))
 
-    _save_patch_cache(cache_key, results)
+    if cache_patches:
+        _save_patch_cache(cache_key, results)
     return results
-
-
-# Keep process_tile as alias for backward compatibility
-process_tile = process_tile_from_cache
 
 
 def build_batch_tensor(

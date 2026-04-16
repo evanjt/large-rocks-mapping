@@ -103,7 +103,7 @@ Thanks for your interest in this project!
 
 # Nationwide Detection Pipeline
 
-Applies the trained model to Swisstopo tiles at national scale. Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), GDAL CLI tools (`gdaldem`), and network access to data.geo.admin.ch.
+Applies the trained model to Swisstopo tiles at national scale. Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), GDAL CLI tools (`gdaldem`, `gdalbuildvrt`), and network access to data.geo.admin.ch.
 
 ## Install
 
@@ -113,26 +113,46 @@ Applies the trained model to Swisstopo tiles at national scale. Requires Python 
     # AMD GPU (ROCm)
     uv sync --extra rocm
 
-## Run
+## Quick start
 
-The `--extra` must match the install step on every `uv run` call (`cuda` or `rocm`).
+    # A few specific tiles
+    uv run --extra cuda large-rocks-mapping run \
+        --model models/active_teacher.pt \
+        --coords 2587-1133 --coords 2588-1133
 
-    # Specific tiles
-    uv run --extra cuda large-rocks-mapping \
-        --model models/best.pt --coords 2587-1133
-
-    # Bounding box (WGS84: west,south,east,north)
-    uv run --extra cuda large-rocks-mapping \
-        --model models/best.pt \
-        --bbox 7.1436,46.2544,7.4738,46.3981 \
-        --no-dedup --iou 0.70 --min-elevation 0
+    # A bounding box (WGS84: west,south,east,north)
+    uv run --extra cuda large-rocks-mapping run \
+        --model models/active_teacher.pt \
+        --bbox "7.05,46.08,7.35,46.50" \
+        --output detections_bas_valais.duckdb
 
     # All of Switzerland
-    uv run --extra cuda large-rocks-mapping \
-        --model models/best.pt --all
+    uv run --extra cuda large-rocks-mapping run \
+        --model models/active_teacher.pt --all
 
     # Full option reference
-    uv run --extra cuda large-rocks-mapping --help
+    uv run large-rocks-mapping run --help
+
+Without a pre-built cache, `run` streams the full pipeline per tile: download RGB+DSM from Swisstopo, generate hillshade, crop/resample patches, fuse, run YOLO inference, write to DuckDB. Processed tiles are checkpointed — re-running the same output file skips completed tiles.
+
+## Fill cache (optional, no GPU needed)
+
+    uv run large-rocks-mapping fill-cache --all --cache-dir /ssd4tb/eceo-rock-data
+
+Pre-fills the patch cache overnight or while the GPU is busy. Uses the same processing as `run` — next `run` with the same `--cache-dir` will load cached patches and skip preprocessing.
+
+## Cache architecture
+
+The cache directory uses a two-tier layout:
+
+    data/tile_cache/
+    ├── downloads/    # Raw .tif + hillshade .npy — LRU evicted per --cache-gb
+    ├── patches/      # Fused .patchbin files — never evicted
+    └── stac_cache.duckdb
+
+**Downloads** (raw tiles, hillshade intermediates) are subject to LRU eviction controlled by `--cache-gb`. **Patches** (the expensive output of preprocessing) are stored separately and never evicted — cached patches persist across runs regardless of cache budget.
+
+## `run` options
 
 | Option | Default | Description |
 |---|---|---|
@@ -152,7 +172,16 @@ The `--extra` must match the install step on every `uv run` call (`cuda` or `roc
 | `--rgb-urls` | | CSV of SwissIMAGE URLs (one per line) |
 | `--dsm-urls` | | CSV of swissALTI3D URLs (one per line) |
 | `--cache-dir` | `data/tile_cache` | Tile cache directory |
-| `--cache-gb` | `500` | Max tile cache in GB, 0 to disable |
-| `--max-batch-tiles` | `8` | Tiles per GPU batch |
+| `--cache-gb` | `500` | Max download cache in GB (patches are unlimited) |
+| `--max-batch-tiles` | `16` | Tiles per GPU batch |
 
-Writes detections to DuckDB and auto-exports a GeoPackage (`.gpkg`). Processed tiles are checkpointed — re-running the same output file skips completed tiles. Downloaded tiles and STAC query results are cached on disk in `--cache-dir`.
+## `fill-cache` options
+
+Same tile-source options as `run` (`--coords`, `--bbox`, `--all`, `--rgb-urls`, `--dsm-urls`), plus:
+
+| Option | Default | Description |
+|---|---|---|
+| `--cache-dir` | `data/tile_cache` | Cache directory (must match `run`) |
+| `--cache-gb` | `500` | Max download cache in GB (patches are unlimited) |
+| `--workers` | `12` | Parallel preprocessing workers |
+| `--min-elevation` | `1500` | Skip tiles below this elevation |

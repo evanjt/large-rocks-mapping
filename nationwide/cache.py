@@ -78,23 +78,100 @@ class TileCache:
                 total -= s.st_size
 
 
+class PatchStore:
+    """File store for preprocessed patches. NO size limit, NO LRU eviction.
+
+    Patches are the expensive output of preprocessing — they must never be
+    evicted by the download cache's LRU policy.
+    """
+
+    def __init__(self, patch_dir: Path) -> None:
+        self._dir = patch_dir
+        self._dir.mkdir(parents=True, exist_ok=True)
+
+    def put(self, key: str, data: bytes) -> None:
+        if not data:
+            return
+        (self._dir / key).write_bytes(data)
+
+    def get(self, key: str) -> bytes | None:
+        path = self._dir / key
+        try:
+            data = path.read_bytes()
+            return data if data else None
+        except (FileNotFoundError, OSError):
+            return None
+
+    def path(self, key: str) -> Path | None:
+        p = self._dir / key
+        try:
+            if p.exists() and p.stat().st_size > 0:
+                return p
+        except OSError:
+            pass
+        return None
+
+
 _tile_cache: TileCache | None = None
+_patch_store: PatchStore | None = None
 _cache_config: tuple[str, int] | None = None
 
 
+def _migrate_flat_cache(cache_dir: Path) -> None:
+    """Move files from flat cache layout to tiered subdirectories.
+
+    Idempotent: files already in subdirectories are not in the root.
+    """
+    downloads_dir = cache_dir / "downloads"
+    patches_dir = cache_dir / "patches"
+    downloads_dir.mkdir(exist_ok=True)
+    patches_dir.mkdir(exist_ok=True)
+
+    moved = 0
+    for f in cache_dir.iterdir():
+        if f.is_dir():
+            continue
+        suffix = f.suffix.lower()
+        if suffix in (".tif", ".npy"):
+            f.rename(downloads_dir / f.name)
+            moved += 1
+        # .duckdb and other files stay in root
+
+    if moved:
+        log.info("Cache migration: moved %d download files to downloads/", moved)
+
+
 def init_cache(cache_dir: Path, max_gb: float) -> None:
-    """Initialise the module-level tile cache."""
-    global _tile_cache, _cache_config
+    """Initialise the module-level tile cache and patch store.
+
+    Downloads (raw .tif) go in downloads/ with LRU eviction.
+    Patches (.patchbin) go in patches/ with NO eviction.
+    """
+    global _tile_cache, _patch_store, _cache_config
     if max_gb <= 0:
         _tile_cache = None
+        _patch_store = None
         _cache_config = None
         return
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _migrate_flat_cache(cache_dir)
+
     max_bytes = int(max_gb * 1_000_000_000)
-    _tile_cache = TileCache(cache_dir, max_bytes)
+    _tile_cache = TileCache(cache_dir / "downloads", max_bytes)
+    _patch_store = PatchStore(cache_dir / "patches")
     _cache_config = (str(cache_dir), max_bytes)
-    current_bytes = sum(f.stat().st_size for f in cache_dir.iterdir() if f.is_file())
-    pct = current_bytes / max_bytes * 100 if max_bytes > 0 else 0
-    log.info("Tile cache: %s (%.1f / %.1f GB, %.0f%%)", cache_dir, current_bytes / 1e9, max_gb, pct)
+
+    dl_dir = cache_dir / "downloads"
+    dl_bytes = sum(f.stat().st_size for f in dl_dir.iterdir() if f.is_file())
+    patch_dir = cache_dir / "patches"
+    patch_count = sum(1 for f in patch_dir.iterdir() if f.is_file())
+    patch_bytes = sum(f.stat().st_size for f in patch_dir.iterdir() if f.is_file())
+
+    log.info(
+        "Tile cache: %s (downloads: %.1f/%.1f GB | patches: %.1f GB, %d files)",
+        cache_dir, dl_bytes / 1e9, max_gb, patch_bytes / 1e9, patch_count,
+    )
 
 
 def get_cache_config() -> tuple[str, int] | None:
@@ -103,12 +180,15 @@ def get_cache_config() -> tuple[str, int] | None:
 
 
 def reinit_cache(cache_dir: str | None, max_bytes: int) -> None:
-    """Re-create the tile cache in a worker process."""
-    global _tile_cache
+    """Re-create the tile cache and patch store in a worker process."""
+    global _tile_cache, _patch_store
     if cache_dir is not None and max_bytes > 0:
-        _tile_cache = TileCache(Path(cache_dir), max_bytes)
+        root = Path(cache_dir)
+        _tile_cache = TileCache(root / "downloads", max_bytes)
+        _patch_store = PatchStore(root / "patches")
     else:
         _tile_cache = None
+        _patch_store = None
 
 
 def cache_path(url: str) -> Path | None:
@@ -129,6 +209,29 @@ def cache_put(url: str, data: bytes) -> None:
     """Store downloaded bytes in the cache."""
     if _tile_cache is not None:
         _tile_cache.put(url, data)
+
+
+# --- Patch store (no eviction) ---
+
+
+def patch_path(key: str) -> Path | None:
+    """Return filesystem path to a cached patch file, or None."""
+    if _patch_store is None:
+        return None
+    return _patch_store.path(key)
+
+
+def patch_get(key: str) -> bytes | None:
+    """Return cached patch bytes for key, or None."""
+    if _patch_store is None:
+        return None
+    return _patch_store.get(key)
+
+
+def patch_put(key: str, data: bytes) -> None:
+    """Store patch bytes (never evicted)."""
+    if _patch_store is not None:
+        _patch_store.put(key, data)
 
 
 # --- STAC response cache (DuckDB) ---
@@ -202,6 +305,39 @@ def save_neighbor_cache(resolved: dict[str, tuple[str, str]]) -> None:
         con.close()
     except Exception as exc:
         log.warning(f"Neighbor cache write failed: {exc}")
+
+
+def load_neighbor_misses() -> set[str]:
+    """Load coords previously resolved as missing (no tile on server)."""
+    if _stac_cache_path is None or not _stac_cache_path.exists():
+        return set()
+    try:
+        con = duckdb.connect(str(_stac_cache_path), read_only=True)
+        rows = con.execute("SELECT coord FROM neighbor_misses").fetchall()
+        con.close()
+        return {r[0] for r in rows}
+    except Exception:
+        return set()
+
+
+def save_neighbor_misses(coords: set[str]) -> None:
+    """Persist coords confirmed missing from the server."""
+    if _stac_cache_path is None or not coords:
+        return
+    try:
+        con = duckdb.connect(str(_stac_cache_path))
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS neighbor_misses (
+                coord VARCHAR PRIMARY KEY
+            )
+        """)
+        con.executemany(
+            "INSERT OR REPLACE INTO neighbor_misses (coord) VALUES (?)",
+            [(c,) for c in coords],
+        )
+        con.close()
+    except Exception as exc:
+        log.warning(f"Neighbor misses cache write failed: {exc}")
 
 
 def save_stac_cache(bbox: str, tiles: list[tuple[str, str, str]]) -> None:
